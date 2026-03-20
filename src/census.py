@@ -412,6 +412,111 @@ def _build_joint(age_df: pd.DataFrame, sex_df: pd.DataFrame,
 
 
 # ---------------------------------------------------------------------------
+# Scotland synthetic census
+# ---------------------------------------------------------------------------
+# ONS Nomis only covers England & Wales. Scotland uses the National Records of
+# Scotland (NRS) census and a separate geography. We synthesise approximate
+# demographic cells for each Scottish 2024 Westminster constituency using
+# published 2022 Scottish Census aggregate proportions.
+#
+# Sources:
+#   Age / sex:   NRS Table TS008 / TS007 (Scotland Census 2022)
+#   Education:   NRS Table TS067 — ~47% with Level 4+ qualification
+#   Ethnicity:   NRS Table TS021 — ~96% White (Scottish/British/Other)
+
+_SCOTLAND_AGE_SHARES = {  # voting-age population (18+) proportions
+    "18-24": 0.112,
+    "25-34": 0.165,
+    "35-49": 0.255,
+    "50-64": 0.245,
+    "65+":   0.223,
+}
+_SCOTLAND_SEX_SHARES = {"male": 0.488, "female": 0.512}
+_SCOTLAND_EDU_SHARES = {"degree": 0.47, "no_degree": 0.53}
+_SCOTLAND_ETH_SHARES = {"white_british": 0.960, "other": 0.040}
+
+
+def _synthesise_scotland(results_path: Path) -> pd.DataFrame:
+    """
+    Build synthetic census cells for Scotland's 57 constituencies.
+    Requires data/results_2024.csv for constituency codes, names, and
+    electorates.
+    """
+    if not results_path.exists():
+        logger.warning("results_2024.csv not found — cannot synthesise Scotland census")
+        return pd.DataFrame()
+
+    results = pd.read_csv(results_path)
+    scotland = results[results["constituency_code"].str.startswith("S14")].copy()
+    if scotland.empty:
+        logger.warning("No S14 codes in results_2024.csv — Scotland census synthesis skipped")
+        return pd.DataFrame()
+
+    logger.info("Synthesising census cells for %d Scottish constituencies", len(scotland))
+
+    rows = []
+    for _, seat in scotland.iterrows():
+        pcon_code = seat["constituency_code"]
+        pcon_name = seat.get("constituency_name", pcon_code)
+        electorate = seat.get("electorate_2024", 72000)
+
+        for age, a_sh in _SCOTLAND_AGE_SHARES.items():
+            for sex, s_sh in _SCOTLAND_SEX_SHARES.items():
+                for edu, e_sh in _SCOTLAND_EDU_SHARES.items():
+                    for eth, x_sh in _SCOTLAND_ETH_SHARES.items():
+                        pop = electorate * a_sh * s_sh * e_sh * x_sh
+                        rows.append({
+                            "constituency_code": pcon_code,
+                            "constituency_name": pcon_name,
+                            "age":        age,
+                            "sex":        sex,
+                            "education":  edu,
+                            "ethnicity":  eth,
+                            "population": pop,
+                        })
+
+    df = pd.DataFrame(rows)
+    df["proportion"] = df.groupby("constituency_code")["population"].transform(
+        lambda x: x / x.sum()
+    )
+    return df
+
+
+def patch_census_scotland(force: bool = False) -> pd.DataFrame:
+    """
+    Ensure census_2021.csv includes Scottish constituencies.
+    If Scotland is already present and force=False, returns the existing CSV.
+    Otherwise, synthesises Scottish cells and appends them.
+    """
+    results_path = DATA_DIR / "results_2024.csv"
+
+    if OUT_CSV.exists():
+        existing = pd.read_csv(OUT_CSV)
+        has_scotland = existing["constituency_code"].str.startswith("S14").any()
+        if has_scotland and not force:
+            logger.info("Census already has Scottish constituencies — skipping patch")
+            return existing
+        # Remove any stale Scottish rows before re-adding
+        existing = existing[~existing["constituency_code"].str.startswith("S14")]
+    else:
+        existing = pd.DataFrame()
+
+    scotland_df = _synthesise_scotland(results_path)
+    if scotland_df.empty:
+        return existing
+
+    combined = pd.concat([existing, scotland_df], ignore_index=True)
+    combined.to_csv(OUT_CSV, index=False)
+    logger.info(
+        "Patched census: %d total cells across %d constituencies (incl. %d Scottish)",
+        len(combined),
+        combined["constituency_code"].nunique(),
+        scotland_df["constituency_code"].nunique(),
+    )
+    return combined
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -452,7 +557,9 @@ def build_census(force: bool = False) -> pd.DataFrame:
         "Saved %d cells across %d constituencies to %s",
         len(joint), joint["constituency_code"].nunique(), OUT_CSV,
     )
-    return joint
+
+    # Extend with synthetic Scottish census (ONS Nomis covers E&W only)
+    return patch_census_scotland(force=True)
 
 
 def load() -> pd.DataFrame:

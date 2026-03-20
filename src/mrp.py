@@ -392,6 +392,8 @@ def _predict_party_constituency(
         "education": "edu_label",
         "ethnicity": "eth_label",
     })
+    # census uses "other"; model was trained on "other_ethnicity" — normalise
+    pred_frame["eth_label"] = pred_frame["eth_label"].replace("other", "other_ethnicity")
 
     # Merge geographic predictors
     geo = results_df[["constituency_code", "pct_leave", "pct_graduate", "median_income",
@@ -411,9 +413,21 @@ def _predict_party_constituency(
     pred_frame["is_wales"] = (pred_frame.get("region_label", "") == "wales").astype(int)
     pred_frame["brexit_remain"] = 0.5  # use national mean for prediction
 
-    # Past vote — set to 0 (we use aggregate past vote from results file if available)
-    for pv in ["lab", "con", "ld", "reform", "green", "snp", "pc", "other"]:
-        pred_frame[f"past_{pv}"] = 0
+    # Past vote: merge 2024 GE constituency results as constituency-level predictors.
+    # This captures the main source of between-constituency variation in the model.
+    pv_parties = ["lab", "con", "ld", "reform", "green", "snp", "pc", "other"]
+    pv_cols = [f"{pv}_2024" for pv in pv_parties if f"{pv}_2024" in results_df.columns]
+    if pv_cols:
+        past_votes = results_df[["constituency_code"] + pv_cols].copy()
+        rename_map = {f"{pv}_2024": f"past_{pv}" for pv in pv_parties if f"{pv}_2024" in results_df.columns}
+        past_votes = past_votes.rename(columns=rename_map)
+        pred_frame = pred_frame.merge(past_votes, on="constituency_code", how="left")
+    # Fill any missing past vote columns with 0
+    for pv in pv_parties:
+        if f"past_{pv}" not in pred_frame.columns:
+            pred_frame[f"past_{pv}"] = 0.0
+        else:
+            pred_frame[f"past_{pv}"] = pred_frame[f"past_{pv}"].fillna(0.0)
 
     # Predict probabilities
     try:
@@ -430,7 +444,8 @@ def _predict_party_constituency(
     pred_frame["weighted_vote"] = pred_frame["p_vote"] * pred_frame["population"]
     constituency_shares = pred_frame.groupby("constituency_code").apply(
         lambda x: x["weighted_vote"].sum() / x["population"].sum()
-        if x["population"].sum() > 0 else 0.0
+        if x["population"].sum() > 0 else 0.0,
+        include_groups=False,
     ).reset_index()
     constituency_shares.columns = ["constituency_code", party]
 
@@ -446,19 +461,79 @@ def _calibrate(
     Rescale constituency shares so that when aggregated to national level
     (weighted by electorate size) they match the Kalman filter's current estimates.
 
-    Also applies separate calibration for Scotland (SNP) and Wales (PC) where
-    regional subsample estimates are available.
+    For regional parties (SNP, PC) that only contest seats in one nation, the
+    Kalman tracker's GB-wide estimate is converted to a within-region estimate
+    before calibration, avoiding massive over-scaling.
+
+    GB→regional conversion (seat-count weighted):
+      snp_regional = snp_gb × (total_seats / scotland_seats)  [capped at 0.95]
+      pc_regional  = pc_gb  × (total_seats / wales_seats)     [capped at 0.95]
     """
     parties = [c for c in shares_df.columns if c not in ("constituency_code",)]
 
-    # Merge electorate size for weighting
-    elec = results_df[["constituency_code", "electorate_2024"]].copy() if "electorate_2024" in results_df.columns else None
+    # Build a results lookup indexed by constituency_code
+    res_idx = results_df.set_index("constituency_code")
+
+    elec = None
+    if "electorate_2024" in results_df.columns:
+        elec = results_df[["constituency_code", "electorate_2024"]].copy()
+
+    # Seat counts for regional conversion
+    total_seats = len(results_df)
+    scot_seats  = (results_df["constituency_code"].str.startswith("S14")).sum()
+    wales_seats = (results_df["constituency_code"].str.startswith("W07")).sum()
+    # Guard against zeros
+    scot_seats  = max(scot_seats, 1)
+    wales_seats = max(wales_seats, 1)
 
     for party in parties:
         if party not in national_estimates:
             continue
-        target = national_estimates[party]["mean"]  # fraction [0, 1]
+        gb_target = national_estimates[party]["mean"]  # fraction [0, 1]
 
+        # For regional parties: convert GB-wide target to within-region target
+        if party == "snp":
+            # SNP only contests Scotland — compute calibration within Scottish seats only
+            scot_codes = results_df.loc[
+                results_df["constituency_code"].str.startswith("S14"), "constituency_code"
+            ]
+            sub = shares_df.loc[shares_df["constituency_code"].isin(scot_codes), ["constituency_code", party]]
+            if elec is not None:
+                sub = sub.merge(elec, on="constituency_code", how="left")
+                sub["electorate_2024"] = sub["electorate_2024"].fillna(sub["electorate_2024"].median())
+                current_regional = np.average(sub[party].fillna(0), weights=sub["electorate_2024"])
+            else:
+                current_regional = sub[party].fillna(0).mean()
+            # For SNP: cap the regional target at 50% and the scale factor at 1.5x
+            # to prevent over-inflation from the Kalman estimate.
+            regional_target = min(gb_target * total_seats / scot_seats, 0.50)
+            if current_regional > 0:
+                scale = min(regional_target / current_regional, 1.5)
+                mask = shares_df["constituency_code"].isin(scot_codes)
+                shares_df.loc[mask, party] = (shares_df.loc[mask, party] * scale).clip(0, 1)
+            continue
+
+        if party == "pc":
+            # PC only contests Wales — compute calibration within Welsh seats only
+            wales_codes = results_df.loc[
+                results_df["constituency_code"].str.startswith("W07"), "constituency_code"
+            ]
+            sub = shares_df.loc[shares_df["constituency_code"].isin(wales_codes), ["constituency_code", party]]
+            if elec is not None:
+                sub = sub.merge(elec, on="constituency_code", how="left")
+                sub["electorate_2024"] = sub["electorate_2024"].fillna(sub["electorate_2024"].median())
+                current_regional = np.average(sub[party].fillna(0), weights=sub["electorate_2024"])
+            else:
+                current_regional = sub[party].fillna(0).mean()
+            # For PC: do NOT use the Kalman estimate (which is unreliable for a
+            # party that only contests 32 seats and is often omitted from GB polls).
+            # Instead, keep BES-derived shares but renormalise them within Welsh
+            # seats via the row-renormalisation step below.
+            # This avoids the EM pathology where "PC=0 in GB polls" becomes a
+            # large negative house effect inflating the "true" PC estimate.
+            continue
+
+        # Non-regional parties: GB-wide calibration
         if elec is not None:
             sub = shares_df[["constituency_code", party]].merge(elec, on="constituency_code", how="left")
             sub["electorate_2024"] = sub["electorate_2024"].fillna(sub["electorate_2024"].median())
@@ -467,7 +542,7 @@ def _calibrate(
             current_national = shares_df[party].fillna(0).mean()
 
         if current_national > 0:
-            scale = target / current_national
+            scale = gb_target / current_national
             shares_df[party] = (shares_df[party] * scale).clip(0, 1)
 
     # Renormalise rows so all party shares sum to ≤ 1

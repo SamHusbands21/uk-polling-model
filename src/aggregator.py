@@ -45,7 +45,15 @@ SMOOTHED_PATH = PROCESSED_DIR / "smoothed_shares.parquet"
 # ---------------------------------------------------------------------------
 
 # Process noise: how much the true support can move per day (std dev in pp)
-PROCESS_NOISE_STD = 0.15  # percentage points per day
+PROCESS_NOISE_STD = 0.15  # percentage points per day — used for major parties
+
+# Party-specific process noise overrides for regional/minor parties whose
+# true support changes more slowly (and whose polls are sparse + rounded)
+PROCESS_NOISE_BY_PARTY: dict[str, float] = {
+    "snp":    0.05,   # SNP polling is more stable; sparse Scottish sub-samples
+    "pc":     0.02,   # Plaid Cymru is very stable; very sparse Welsh sub-samples
+    "green":  0.10,   # Greens can surge but not as volatile as Reform
+}
 
 # Observation noise: poll sampling error (std dev in pp)
 OBS_NOISE_STD = 2.0  # percentage points
@@ -295,15 +303,16 @@ def run_em(
     for iteration in range(EM_MAX_ITER):
         dates, obs_arr, wt_arr = _build_daily_grid(polls, house_effects)
 
-        # E-step: Kalman smoother per party
+        # E-step: Kalman smoother per party (use party-specific process noise if set)
         smoothed_means = {}
         smoothed_vars = {}
         for p in PARTIES:
+            q_p = PROCESS_NOISE_BY_PARTY.get(p, PROCESS_NOISE_STD) ** 2
             sm, sv = _kalman_smooth(
                 obs_arr[p], wt_arr[p],
                 init_mean=init_means[p],
                 init_var=init_var,
-                q=q, r=r,
+                q=q_p, r=r,
             )
             smoothed_means[p] = sm
             smoothed_vars[p] = sv

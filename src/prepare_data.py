@@ -5,19 +5,22 @@ Processes raw data files into the CSVs expected by mrp.py, ml_model.py
 and seat_projector.py.
 
 Outputs:
-  data/bes_2024.csv        -- BES Wave 30 microdata (requires MAIN BES file)
+  data/bes_2024.csv        -- BES Wave 30 microdata
   data/results_2024.csv    -- 2024 GE results + geographic features
 
-IMPORTANT — BES DATA:
-  The file data/BES2024_W30Strings_v30.1.dta is a SUPPLEMENTARY file
-  containing only open-ended text responses. You also need the MAIN dataset.
-
-  Go back to https://www.britishelectionstudy.com/data-objects/panel-study-data/
-  and download "BES Internet Panel Wave 30" (without "Strings" in the filename).
-  Save it to data/ as one of:
-    - data/BES2024_W30_v30.1.dta   (Stata format, preferred)
-    - data/BES2024_W30_v30.1.sav   (SPSS format, also supported)
-    - data/bes_wave30.dta
+BES file used: BES2024_W30_Panel_v30.1.dta
+  (Combined Wave 1-30 Internet Panel, N=122,372, version 30.1)
+  Key columns used:
+    generalElectionVoteW30  — current vote intention (May 2025)
+    generalElectionVoteW29  — pre-election vote intention (Wave 29)
+    euRefVoteW4             — EU referendum vote (Wave 4, 2016)
+    gorW30                  — Government Office Region string label
+    pcon_codeW30            — ONS constituency code
+    Age                     — respondent age (constant, capital A)
+    gender                  — Male / Female (constant)
+    p_edlevelW30            — education level
+    p_ethnicityW30          — ethnicity
+    wt_new_W30              — survey weight
 
 Usage:
   python -m src.prepare_data            # skip if outputs exist
@@ -48,6 +51,8 @@ RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
 
 BES_CANDIDATES = [
+    DATA_DIR / "BES2024_W30_Panel_v30.1.dta",   # Combined W1-30 Panel (v30.1)
+    DATA_DIR / "BES2024_W30_Panel_v30.1.sav",
     DATA_DIR / "BES2024_W30_v30.1.dta",
     DATA_DIR / "BES2024_W30_v30.1.sav",
     DATA_DIR / "bes_wave30.dta",
@@ -69,44 +74,48 @@ EU_REF_URL = (
 EU_REF_RAW = RAW_DIR / "eu_ref_lca.csv"
 
 # ---------------------------------------------------------------------------
-# BES column mapping (MAIN BES dataset, not the Strings file)
+# BES column mapping (BES2024_W30_Panel_v30.1.dta — Combined Wave 1-30)
 # ---------------------------------------------------------------------------
-# These are the standard BES Wave 30 variable names.
-# Adjust only if your file uses different names — check the codebook PDF.
+# Column names verified against the actual file. With convert_categoricals=True
+# all categorical columns return string labels, not numeric codes.
 BES_COL_MAP = {
-    "weight":         "wt_new_W30",      # Survey weight for Wave 30
-    "region":         "gor",             # Government Office Region (numeric/label)
-    "pcon_code":      "pcon",            # ONS constituency code e.g. E14001063
-    "age":            "age",             # Raw age (integer)
-    "sex":            "gender",          # 1=Male, 2=Female (or "Male"/"Female")
-    "edlevel":        "edlevel",         # 0=None … 5=Postgrad
-    "ethnicity":      "p_ethnicity",     # 1=White British (see BES codebook)
-    "vote_intention": "generalElectionVoteW30",   # Vote in 2024 GE (post-election)
-    "past_vote_2024": "generalElectionVoteW29",   # Vote intention pre-election
-    "brexit_vote":    "euRefVoteW4",     # EU ref: 1=Remain, 2=Leave
+    "weight":         "wt_new_W30",           # Survey weight for Wave 30 (~30k non-NaN)
+    "region":         "gorW30",               # GOR string e.g. "Scotland", "South East"
+    "pcon_code":      "pcon_codeW30",         # ONS code e.g. "E14001063"
+    "age":            "Age",                  # Raw age (capital A; constant across waves)
+    "sex":            "gender",               # "Male" / "Female" (constant)
+    "edlevel":        "p_edlevelW30",         # "Undergraduate","GCSE","A-level","Postgrad","No qualifications","Below GCSE"
+    "ethnicity":      "p_ethnicityW30",       # "White British", "Indian", etc.
+    "vote_intention": "generalElectionVoteW30",  # Current vote intention (May 2025)
+    "past_vote_2024": "generalElectionVoteW29",  # Pre-election intention (Wave 29, Summer 2024)
+    "brexit_vote":    "euRefVoteW4",             # "Stay/remain in the EU" / "Leave the EU"
 }
 
-# String → normalised code mapping for vote columns when read with value labels
+# String → normalised code mapping for vote columns
+# Values confirmed from BES2024_W30_Panel_v30.1.dta with convert_categoricals=True
 PARTY_LABEL_MAP = {
-    "labour":                    "lab",
-    "conservative":              "con",
-    "liberal democrat":          "ld",
-    "liberal democrats":         "ld",
-    "reform uk":                 "reform",
-    "reform":                    "reform",
-    "green party":               "green",
-    "green":                     "green",
+    "labour":                        "lab",
+    "conservative":                  "con",
+    "liberal democrat":              "ld",
+    "liberal democrats":             "ld",
+    "brexit party/reform uk":        "reform",
+    "reform uk":                     "reform",
+    "reform":                        "reform",
+    "green party":                   "green",
+    "green":                         "green",
     "scottish national party (snp)": "snp",
-    "scottish national party":   "snp",
-    "snp":                       "snp",
-    "plaid cymru":               "pc",
-    "ukip":                      "reform",
-    "uk independence party":     "reform",
-    "brexit party":              "reform",
-    "would not vote":            "notVote",
-    "don't know":                "dontKnow",
-    "not sure":                  "dontKnow",
-    "other":                     "other",
+    "scottish national party":       "snp",
+    "snp":                           "snp",
+    "plaid cymru":                   "pc",
+    "ukip":                          "reform",
+    "uk independence party":         "reform",
+    "brexit party":                  "reform",
+    "an independent candidate":      "other",
+    "i would/did not vote":          "notVote",
+    "would not vote":                "notVote",
+    "don't know":                    "dontKnow",
+    "not sure":                      "dontKnow",
+    "other":                         "other",
 }
 
 # BES GOR numeric → region label  (standard BES coding)
@@ -195,9 +204,29 @@ def _find_bes_main() -> Path | None:
 
 
 def _read_bes_dta(path: Path) -> pd.DataFrame:
-    """Read a BES .dta file with categorical label expansion."""
+    """
+    Read a BES .dta file with categorical label expansion.
+    Applies a monkey-patch for the Latin-1 strl encoding issue in pandas
+    when reading large Stata 15+ format files.
+    """
     logger.info("Reading BES Stata file: %s", path)
-    df = pd.read_stata(str(path), convert_categoricals=True)
+
+    import pandas.io.stata as stata_mod
+    original_read_strls = stata_mod.StataReader._read_strls
+    def _patched_strls(self):
+        orig_enc = self._encoding
+        self._encoding = "latin-1"
+        try:
+            original_read_strls(self)
+        finally:
+            self._encoding = orig_enc
+    stata_mod.StataReader._read_strls = _patched_strls
+
+    try:
+        df = pd.read_stata(str(path), convert_categoricals=True)
+    finally:
+        stata_mod.StataReader._read_strls = original_read_strls
+
     logger.info("  Loaded: %d respondents, %d columns", len(df), len(df.columns))
     return df
 
@@ -246,16 +275,25 @@ def _auto_detect_columns(df: pd.DataFrame) -> dict[str, str]:
         mapping["weight"] = wt_w[0] if wt_w else wt_cols[0]
         logger.info("Auto-detected weight: %s", mapping["weight"])
 
-    # GOR
-    for candidate in ["gor", "GOR", "gorW1", "region"]:
+    # GOR — prefer the latest wave suffix (gorW30, gorW29, …)
+    gor_wave_cols = sorted(
+        [c for c in cols if c.startswith("gor") and c[3:].lstrip("W").isdigit()],
+        key=lambda c: int(c.lstrip("gorW")),
+        reverse=True,
+    )
+    fallback_gors = ["gorW30", "gorW1", "gor", "GOR", "region"]
+    gor_candidates = (gor_wave_cols + fallback_gors)
+    for candidate in gor_candidates:
         if candidate in cols:
             mapping["region"] = candidate
+            logger.info("Auto-detected region: %s", candidate)
             break
 
-    # PCON
-    for candidate in ["pcon", "PCON", "pconW1", "constituency"]:
+    # PCON code — prefer pcon_codeW30 (ONS code), then pconW30 (name)
+    for candidate in ["pcon_codeW30", "new_pcon_codeW30", "pconW30", "pcon", "PCON", "constituency"]:
         if candidate in cols:
             mapping["pcon_code"] = candidate
+            logger.info("Auto-detected pcon_code: %s", candidate)
             break
 
     return mapping
@@ -307,14 +345,23 @@ def prepare_bes(force: bool = False) -> bool:
         logger.warning("Update BES_COL_MAP in src/prepare_data.py to match your file.")
         logger.warning("Available columns (first 40): %s", list(df.columns[:40]))
 
+    # Filter to Wave 30 participants (rows where the weight is non-NaN)
+    wt_col = mapping.get("weight", "wt_new_W30")
+    if wt_col in df.columns:
+        n_total = len(df)
+        df = df[df[wt_col].notna()].copy()
+        logger.info("Filtered to Wave 30 respondents: %d of %d rows", len(df), n_total)
+        df = df.reset_index(drop=True)
+
     # Build output DataFrame with standardised names
     out = pd.DataFrame()
-    out["id"] = df.get("id", pd.RangeIndex(len(df)))
+    out["id"] = df["id"] if "id" in df.columns else pd.RangeIndex(len(df))
 
     # Weight
-    wt_col = mapping.get("weight", "wt_new_W30")
-    out["weight"] = (df[wt_col].fillna(1.0).clip(0.1, 10.0)
-                     if wt_col in df.columns else 1.0)
+    if wt_col in df.columns:
+        out["weight"] = df[wt_col].clip(0.1, 10.0)
+    else:
+        out["weight"] = 1.0
 
     # Region → normalised label
     gor_col = mapping.get("region", "gor")
@@ -344,14 +391,17 @@ def prepare_bes(force: bool = False) -> bool:
         out["sex"] = "male"
 
     # Education
-    edu_col = mapping.get("edlevel", "edlevel")
+    # BES string labels: "Undergraduate", "Postgrad", "A-level", "GCSE",
+    #                    "Below GCSE", "No qualifications"
+    edu_col = mapping.get("edlevel", "p_edlevelW30")
     if edu_col in df.columns:
         raw_edu = df[edu_col]
         if pd.api.types.is_numeric_dtype(raw_edu):
             out["edlevel"] = raw_edu.apply(lambda v: _edu_numeric(v) if pd.notna(v) else "no_degree")
         else:
+            DEGREE_LABELS = {"undergraduate", "postgrad", "postgraduate", "degree", "university"}
             out["edlevel"] = raw_edu.apply(
-                lambda v: "degree" if any(x in str(v).lower() for x in ["degree", "university", "postgrad", "under"]) else "no_degree"
+                lambda v: "degree" if any(x in str(v).lower() for x in DEGREE_LABELS) else "no_degree"
             )
     else:
         out["edlevel"] = "no_degree"
@@ -385,16 +435,29 @@ def prepare_bes(force: bool = False) -> bool:
         out["past_vote_2024"] = np.nan
 
     # Brexit vote
+    # BES string labels: "Stay/remain in the EU", "Leave the EU", "Don't know"
+    # Numeric coding in older waves: 0=Leave, 1=Remain, 9999=N/A
     eu_col = mapping.get("brexit_vote", "euRefVoteW4")
     if eu_col in df.columns:
         raw_eu = df[eu_col]
-        if pd.api.types.is_numeric_dtype(raw_eu):
-            # 1=Remain, 2=Leave
-            out["brexit_vote"] = raw_eu.apply(lambda v: 1 if v == 1 else (0 if v == 2 else np.nan))
-        else:
-            out["brexit_vote"] = raw_eu.apply(
-                lambda v: 1 if "remain" in str(v).lower() else (0 if "leave" in str(v).lower() else np.nan)
-            )
+        def _parse_eu_vote(v):
+            if pd.isna(v):
+                return np.nan
+            if isinstance(v, (int, float)):
+                if v == 1:
+                    return 1  # Remain
+                if v == 0:
+                    return 0  # Leave
+                if v == 2:
+                    return 0  # Legacy coding: 2=Leave in older BES waves
+                return np.nan
+            s = str(v).lower()
+            if "remain" in s or "stay" in s:
+                return 1
+            if "leave" in s:
+                return 0
+            return np.nan
+        out["brexit_vote"] = raw_eu.apply(_parse_eu_vote)
     else:
         out["brexit_vote"] = np.nan
 

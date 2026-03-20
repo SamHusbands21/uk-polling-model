@@ -274,8 +274,8 @@ def _plot_model_comparison(seat_projections: dict, out_path: Path) -> None:
         colors = [PARTY_CONFIG[p]["color"] for p in parties]
         labels = [PARTY_CONFIG[p]["label"] for p in parties]
 
-        yerr_lo = [m - l for m, l in zip(means, lo90)]
-        yerr_hi = [h - m for h, m in zip(hi90, means)]
+        yerr_lo = [max(0, m - l) for m, l in zip(means, lo90)]
+        yerr_hi = [max(0, h - m) for h, m in zip(hi90, means)]
 
         ax.bar(labels, means, color=colors, alpha=0.85,
                yerr=[yerr_lo, yerr_hi], capsize=4,

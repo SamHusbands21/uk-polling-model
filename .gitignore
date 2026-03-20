@@ -16,14 +16,26 @@ venv/
 env/
 .env
 
-# Data files that should not be committed to the public repo
-data/bes_2024.csv           # BES microdata — personal/research use only
+# BES raw survey data — large proprietary files, NOT for public repo
+data/*.dta
+data/*.dta.zip
+data/*.sav
+data/*.sav.zip
+data/*.pdf
+data/*.xlsx
+
+# Derived / rebuilt data files
+data/bes_2024.csv           # BES microdata (rebuilt by prepare_data.py)
+data/results_2024.csv       # HoC results (rebuilt by prepare_data.py)
 data/aggregator_state.pkl   # Rebuilt by pipeline
 data/mrp_coefficients.pkl   # Rebuilt by pipeline
 data/ml_model.joblib        # Rebuilt by pipeline
+data/census_2021.csv        # Rebuilt by src/census.py
 
-# Raw cache files (large, rebuilt automatically)
+# Processed outputs (rebuilt automatically)
+data/processed/
 data/raw/wiki_polls_raw.html
+data/raw/eu_ref_lca.csv
 data/raw/census_*.csv
 
 # Outputs (pushed to website repo by the pipeline, not stored here)
