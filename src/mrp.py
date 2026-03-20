@@ -62,21 +62,28 @@ PARTY_REGION_FILTER = {
 }
 
 # ---------------------------------------------------------------------------
-# BES column name mapping (adjust if your BES CSV uses different names)
+# BES column name mapping
 # ---------------------------------------------------------------------------
+# bes_2024.csv is produced by src/prepare_data.py from the main BES Wave 30
+# file. The column names below are the STANDARDISED names written by that
+# script — not the raw BES variable names.
 
 BES_COL_MAP = {
-    "weight":           "weight",
-    "region":           "gor",          # Government Office Region code
-    "pcon_code":        "pcon",         # Westminster constituency code
-    "age":              "age",          # Raw age (integer)
-    "sex":              "gender",       # 1=Male, 2=Female
-    "edlevel":          "edlevel",      # 0=None, 1=Below GCSE, 2=GCSE, 3=A-Level, 4=Degree, 5=Postgrad
-    "ethnicity":        "p_ethnicity",  # 1=White British, else other
-    "vote_intention":   "generalElectionVoteW25",  # Party the respondent intends to vote for
-    "past_vote_2024":   "generalElectionVoteW23",  # Recalled 2024 vote (post-election wave)
-    "brexit_vote":      "euRefVoteW4",  # 1=Remain, 2=Leave
+    "weight":           "weight",         # survey weight
+    "region":           "region",         # region label e.g. "scotland", "london"
+    "pcon_code":        "pcon_code",       # ONS constituency code e.g. E14001063
+    "age":              "age",             # raw age integer
+    "sex":              "sex",             # "male" / "female"
+    "edlevel":          "edlevel",         # "degree" / "no_degree"
+    "ethnicity":        "ethnicity",       # "white_british" / "other_ethnicity"
+    "vote_intention":   "vote_intention",  # normalised party code: lab/con/ld/reform/green/snp/pc/other
+    "past_vote_2024":   "past_vote_2024",  # normalised party code (pre-election W29 intention)
+    "brexit_vote":      "brexit_vote",     # 1=Remain, 0=Leave (float, may be NaN)
 }
+
+# Normalised party codes used in bes_2024.csv (written by prepare_data.py)
+# The vote_intention column will contain these strings.
+PARTY_CODES = ["lab", "con", "ld", "reform", "green", "snp", "pc", "other"]
 
 # ---------------------------------------------------------------------------
 # Categorical encoders
@@ -96,14 +103,33 @@ def _age_band(age: float) -> str:
     else:
         return "65+"
 
-def _education_level(edlevel: float) -> str:
-    return "degree" if edlevel >= 4 else "no_degree"
+def _education_level(edlevel) -> str:
+    """Accept either numeric code (0-5) or already-normalised string."""
+    if isinstance(edlevel, str):
+        return edlevel if edlevel in ("degree", "no_degree") else "no_degree"
+    try:
+        return "degree" if float(edlevel) >= 4 else "no_degree"
+    except (TypeError, ValueError):
+        return "no_degree"
 
-def _ethnicity_label(eth_code: float) -> str:
-    return "white_british" if eth_code == 1 else "other_ethnicity"
+def _ethnicity_label(eth) -> str:
+    """Accept numeric code (1=White British) or already-normalised string."""
+    if isinstance(eth, str):
+        return eth if eth in ("white_british", "other_ethnicity") else "other_ethnicity"
+    try:
+        return "white_british" if float(eth) == 1 else "other_ethnicity"
+    except (TypeError, ValueError):
+        return "white_british"
 
-def _sex_label(sex_code: float) -> str:
-    return "male" if sex_code == 1 else "female"
+def _sex_label(sex) -> str:
+    """Accept numeric code (1=Male) or already-normalised string."""
+    if isinstance(sex, str):
+        s = sex.lower()
+        return "male" if s.startswith("m") else "female"
+    try:
+        return "male" if float(sex) == 1 else "female"
+    except (TypeError, ValueError):
+        return "male"
 
 
 # ---------------------------------------------------------------------------
@@ -112,99 +138,99 @@ def _sex_label(sex_code: float) -> str:
 
 def _prepare_bes(results_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Load and clean BES 2024 microdata. Returns a DataFrame with
-    standardised columns for modelling.
+    Load and clean bes_2024.csv (produced by src/prepare_data.py).
+    Returns a DataFrame with standardised columns for modelling.
+
+    The CSV already has normalised column names and values:
+      - vote_intention: party code string e.g. "lab", "con", "ld" ...
+      - region: region label string e.g. "scotland", "london" ...
+      - sex: "male" / "female"
+      - edlevel: "degree" / "no_degree"
+      - ethnicity: "white_british" / "other_ethnicity"
+      - brexit_vote: 1.0 = Remain, 0.0 = Leave (float, may be NaN)
     """
     if not BES_PATH.exists():
         raise FileNotFoundError(
             f"BES data not found at {BES_PATH}.\n"
-            "Apply for access at https://www.britishelectionstudy.com/data-objects/panel-study-data/"
-            " and download the 2024 post-election wave CSV."
+            "Run: python -m src.prepare_data\n"
+            "This requires the MAIN BES Wave 30 file (not the Strings file).\n"
+            "Download from: https://www.britishelectionstudy.com/data-objects/panel-study-data/"
         )
 
     bes = pd.read_csv(BES_PATH, low_memory=False)
     logger.info("Loaded BES: %d respondents, %d columns", len(bes), len(bes.columns))
-
-    # Rename columns using the mapping
-    rename = {v: k for k, v in BES_COL_MAP.items() if v in bes.columns}
-    bes = bes.rename(columns=rename)
 
     # Check required columns
     required = {"region", "pcon_code", "age", "vote_intention"}
     missing = required - set(bes.columns)
     if missing:
         raise ValueError(
-            f"BES file is missing required columns: {missing}. "
-            f"Please check BES_COL_MAP in mrp.py matches your file's column names. "
-            f"Available columns: {list(bes.columns[:30])}"
+            f"bes_2024.csv is missing required columns: {missing}. "
+            f"Re-run: python -m src.prepare_data --force"
         )
 
-    # Derive region labels
-    scotland_regions = {"Scotland", "S92000003", "12"}  # common encodings
-    wales_regions = {"Wales", "W92000004", "11"}
-
-    def _region_label(r):
-        r_str = str(r)
-        if r_str in scotland_regions or "scot" in r_str.lower():
-            return "scotland"
-        elif r_str in wales_regions or "wales" in r_str.lower():
-            return "wales"
-        else:
-            return r_str
-
-    bes["region_label"] = bes["region"].apply(_region_label)
+    # Region labels (already normalised by prepare_data.py)
+    bes["region_label"] = bes["region"].astype(str).str.lower().str.strip()
     bes["is_scotland"] = (bes["region_label"] == "scotland").astype(int)
     bes["is_wales"] = (bes["region_label"] == "wales").astype(int)
 
-    # Demographic variables
+    # Demographic variables (columns already normalised by prepare_data.py)
     bes["age_band"] = bes["age"].apply(lambda x: _age_band(float(x)) if pd.notna(x) else "35-49")
-    bes["sex_label"] = bes.get("sex", pd.Series(1, index=bes.index)).apply(
-        lambda x: _sex_label(float(x)) if pd.notna(x) else "male"
+    bes["sex_label"] = bes.get("sex", pd.Series("male", index=bes.index)).apply(
+        lambda x: _sex_label(x) if pd.notna(x) else "male"
     )
-    bes["edu_label"] = bes.get("edlevel", pd.Series(2, index=bes.index)).apply(
-        lambda x: _education_level(float(x)) if pd.notna(x) else "no_degree"
+    bes["edu_label"] = bes.get("edlevel", pd.Series("no_degree", index=bes.index)).apply(
+        lambda x: _education_level(x) if pd.notna(x) else "no_degree"
     )
-    bes["eth_label"] = bes.get("ethnicity", pd.Series(1, index=bes.index)).apply(
-        lambda x: _ethnicity_label(float(x)) if pd.notna(x) else "white_british"
+    bes["eth_label"] = bes.get("ethnicity", pd.Series("white_british", index=bes.index)).apply(
+        lambda x: _ethnicity_label(x) if pd.notna(x) else "white_british"
     )
-    bes["brexit_remain"] = bes.get("brexit_vote", pd.Series(1, index=bes.index)).apply(
-        lambda x: 1 if float(x) == 1 else 0 if pd.notna(x) else 0
-    )
+
+    # Brexit remain (1=Remain, 0=Leave) — already numeric in CSV
+    bes["brexit_remain"] = pd.to_numeric(
+        bes.get("brexit_vote", pd.Series(0.5, index=bes.index)), errors="coerce"
+    ).fillna(0.5)
 
     # Past vote 2024 — one-hot encode main parties
     past_vote_parties = ["lab", "con", "ld", "reform", "green", "snp", "pc", "other"]
-    bes["past_vote_clean"] = bes.get("past_vote_2024", pd.Series("other", index=bes.index)).apply(
-        lambda x: str(x).lower().strip()
-    )
+    past_col = bes.get("past_vote_2024", pd.Series("other", index=bes.index)).astype(str).str.lower()
     for pv in past_vote_parties:
-        bes[f"past_{pv}"] = (bes["past_vote_clean"].str.contains(pv, na=False)).astype(int)
+        bes[f"past_{pv}"] = (past_col == pv).astype(int)
 
     # Merge constituency geographic predictors
-    results_sub = results_df[["constituency_code", "pct_leave", "pct_graduate", "median_income"]].copy()
-    results_sub.columns = ["pcon_code", "pct_leave", "pct_graduate", "median_income"]
-    bes = bes.merge(results_sub, on="pcon_code", how="left")
+    geo_cols = [c for c in ["pct_leave", "pct_graduate", "median_income"] if c in results_df.columns]
+    if geo_cols and "constituency_code" in results_df.columns:
+        results_sub = results_df[["constituency_code"] + geo_cols].copy()
+        results_sub = results_sub.rename(columns={"constituency_code": "pcon_code"})
+        bes = bes.merge(results_sub, on="pcon_code", how="left")
 
-    # Fill missing geo predictors with national means
     for col in ["pct_leave", "pct_graduate", "median_income"]:
-        bes[col] = bes[col].fillna(bes[col].mean())
+        if col in bes.columns:
+            bes[col] = bes[col].fillna(bes[col].mean())
+        else:
+            bes[col] = 0.0
 
-    # Weight — default to 1 if missing
+    # Weight — already normalised in CSV
     if "weight" not in bes.columns:
         bes["weight"] = 1.0
     else:
         bes["weight"] = bes["weight"].fillna(1.0).clip(0.1, 10.0)
 
     # Drop rows with missing vote intention
-    bes = bes[bes["vote_intention"].notna()]
+    bes = bes[bes["vote_intention"].notna() & (bes["vote_intention"] != "nan")]
     logger.info("BES after cleaning: %d respondents", len(bes))
 
     return bes
 
 
 def _make_vote_outcome(bes: pd.DataFrame, party: str) -> pd.Series:
-    """Return a binary series: 1 if respondent intends to vote for party, else 0."""
+    """Return a binary series: 1 if respondent intends to vote for party, else 0.
+
+    vote_intention is a normalised party code produced by prepare_data.py:
+    "lab", "con", "ld", "reform", "green", "snp", "pc", "other".
+    """
     intention = bes["vote_intention"].astype(str).str.lower().str.strip()
-    return intention.str.contains(party, na=False).astype(int)
+    return (intention == party).astype(int)
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +274,7 @@ def _fit_one_party(
         logger.warning("Party %s: fewer than 20 positive outcomes — skipping", party)
         return None
 
-    # Build formula
+    # Build formula using standardised column names from prepare_data.py
     fixed_terms = [
         "C(age_band, Treatment('35-49'))",
         "C(sex_label, Treatment('male'))",
@@ -257,8 +283,11 @@ def _fit_one_party(
         "brexit_remain",
         "pct_leave",
         "pct_graduate",
-        "median_income",
     ]
+
+    # Only include median_income if it has non-zero variance
+    if "median_income" in sub.columns and sub["median_income"].std() > 0:
+        fixed_terms.append("median_income")
 
     # Add regional fixed effects for non-regional parties
     if region_filter is None:
@@ -355,9 +384,14 @@ def _predict_party_constituency(
     region_filter = PARTY_REGION_FILTER.get(party)
 
     # Build prediction frame from census cells
+    # census_2021.csv columns: constituency_code, age, sex, education, ethnicity, population
     pred_frame = census_df.copy()
-    pred_frame = pred_frame.rename(columns={"age": "age_band", "sex": "sex_label",
-                                             "education": "edu_label", "ethnicity": "eth_label"})
+    pred_frame = pred_frame.rename(columns={
+        "age":       "age_band",
+        "sex":       "sex_label",
+        "education": "edu_label",
+        "ethnicity": "eth_label",
+    })
 
     # Merge geographic predictors
     geo = results_df[["constituency_code", "pct_leave", "pct_graduate", "median_income",
