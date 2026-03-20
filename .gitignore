@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Data files that should not be committed to the public repo
+data/bes_2024.csv           # BES microdata — personal/research use only
+data/aggregator_state.pkl   # Rebuilt by pipeline
+data/mrp_coefficients.pkl   # Rebuilt by pipeline
+data/ml_model.joblib        # Rebuilt by pipeline
+
+# Raw cache files (large, rebuilt automatically)
+data/raw/wiki_polls_raw.html
+data/raw/census_*.csv
+
+# Outputs (pushed to website repo by the pipeline, not stored here)
+output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

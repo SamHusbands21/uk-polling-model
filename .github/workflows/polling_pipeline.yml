@@ -1,0 +1,138 @@
+name: UK Polling Pipeline
+
+on:
+  schedule:
+    # Every Sunday at 09:00 UTC → updates visible Monday morning UK time
+    - cron: '0 9 * * 0'
+  workflow_dispatch:
+    # Allow manual trigger from GitHub Actions UI
+    inputs:
+      full_refit:
+        description: 'Force full model refit from scratch (monthly use)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  run_pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ── 1. Check out this repo (uk-polling-model) ─────────────────────────
+      - name: Checkout polling model repo
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history so we can restore cached data
+          fetch-depth: 1
+
+      # ── 2. Set up Python ──────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      # ── 3. Install dependencies ───────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Restore cached pipeline state (avoids full refit every week) ───
+      - name: Restore pipeline cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/aggregator_state.pkl
+            data/mrp_coefficients.pkl
+            data/ml_model.joblib
+            data/census_2021.csv
+            data/raw/
+            data/processed/
+          key: pipeline-state-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            pipeline-state-${{ runner.os }}-
+
+      # ── 5. Run the pipeline ───────────────────────────────────────────────
+      - name: Run polling pipeline
+        run: |
+          FULL_ARG=""
+          if [ "${{ github.event.inputs.full_refit }}" = "true" ]; then
+            FULL_ARG="--full"
+          fi
+          python -m src.pipeline $FULL_ARG
+        env:
+          PYTHONPATH: .
+
+      # ── 6. Check if outputs changed ───────────────────────────────────────
+      - name: Check for new outputs
+        id: check_outputs
+        run: |
+          if [ -f output/polling_predictions.json ]; then
+            echo "has_outputs=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_outputs=false" >> $GITHUB_OUTPUT
+            echo "No outputs generated — skipping website push."
+          fi
+
+      # ── 7. Push outputs to sam_website repo ──────────────────────────────
+      # Requires a fine-grained PAT (WEBSITE_DEPLOY_TOKEN) with:
+      #   Repository: SamHusbands21.github.io
+      #   Permission: Contents → Read and Write
+      - name: Push outputs to website repo
+        if: steps.check_outputs.outputs.has_outputs == 'true'
+        run: |
+          # Configure git identity
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+          # Clone the website repo using the deploy token
+          git clone \
+            "https://x-access-token:${{ secrets.WEBSITE_DEPLOY_TOKEN }}@github.com/SamHusbands21/SamHusbands21.github.io.git" \
+            /tmp/website
+
+          # Copy all output files to the website data/ directory
+          cp output/polling_predictions.json /tmp/website/data/polling_predictions.json
+
+          for img in vote_share_trend.png seat_distribution.png model_comparison.png; do
+            if [ -f "output/$img" ]; then
+              cp "output/$img" "/tmp/website/data/$img"
+              echo "Copied $img"
+            fi
+          done
+
+          # Commit and push (only if there are changes)
+          cd /tmp/website
+          git add data/polling_predictions.json
+          git add data/vote_share_trend.png data/seat_distribution.png data/model_comparison.png 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit — website already up to date."
+          else
+            LAST_POLL=$(python3 -c "
+          import json
+          with open('data/polling_predictions.json') as f:
+              d = json.load(f)
+          print(d.get('last_poll_date', 'unknown'))
+          " 2>/dev/null || echo "unknown")
+
+            git commit -m "chore: update polling model outputs (last poll: ${LAST_POLL}) [$(date +%Y-%m-%d)]"
+            git push
+            echo "Pushed to SamHusbands21.github.io"
+          fi
+
+      # ── 8. Save updated pipeline state to cache ───────────────────────────
+      - name: Save pipeline cache
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/aggregator_state.pkl
+            data/mrp_coefficients.pkl
+            data/ml_model.joblib
+            data/census_2021.csv
+            data/raw/
+            data/processed/
+          key: pipeline-state-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
