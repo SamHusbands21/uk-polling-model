@@ -74,7 +74,7 @@ jobs:
             echo "has_outputs=true" >> $GITHUB_OUTPUT
           else
             echo "has_outputs=false" >> $GITHUB_OUTPUT
-            echo "No outputs generated — skipping website push."
+            echo "No outputs generated - skipping website push."
           fi
 
       # ── 7. Push outputs to sam_website repo ──────────────────────────────
@@ -109,7 +109,7 @@ jobs:
           git add data/vote_share_trend.png data/seat_distribution.png data/model_comparison.png 2>/dev/null || true
 
           if git diff --cached --quiet; then
-            echo "No changes to commit — website already up to date."
+            echo "No changes to commit - website already up to date."
           else
             LAST_POLL=$(python3 -c "
           import json
