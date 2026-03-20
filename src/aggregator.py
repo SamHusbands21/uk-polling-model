@@ -394,8 +394,7 @@ def aggregate(force_full: bool = False) -> AggregatorState:
     # Load existing state for incremental runs
     prev_state: AggregatorState | None = None
     if STATE_PATH.exists() and not force_full:
-        with open(STATE_PATH, "rb") as f:
-            prev_state = pickle.load(f)
+        prev_state = load_state()
         logger.info("Loaded aggregator state (last date: %s)", prev_state.last_date)
 
         # Check if there are any new polls since last run
@@ -447,9 +446,10 @@ def aggregate(force_full: bool = False) -> AggregatorState:
     state.cov_matrix = cov_matrix  # type: ignore[attr-defined]
     state.parties = PARTIES         # type: ignore[attr-defined]
 
-    # Persist state
+    # Persist state as a plain dict so it loads correctly regardless of
+    # which module is __main__ (avoids AggregatorState pickle class mismatch).
     with open(STATE_PATH, "wb") as f:
-        pickle.dump(state, f)
+        pickle.dump(_state_to_dict(state), f)
     logger.info("Saved aggregator state to %s", STATE_PATH)
 
     # Save smoothed series to parquet
@@ -460,6 +460,41 @@ def aggregate(force_full: bool = False) -> AggregatorState:
     return state
 
 
+def _state_to_dict(state: AggregatorState) -> dict:
+    """Serialise an AggregatorState to a plain dict (no class references)."""
+    return {
+        "last_date": state.last_date,
+        "party_states": {
+            p: {"mean": float(ps.mean), "variance": float(ps.variance)}
+            for p, ps in state.party_states.items()
+        },
+        "house_effects": {
+            pollster: {p: float(v) for p, v in effects.items()}
+            for pollster, effects in state.house_effects.items()
+        },
+        "history": state.history,
+        "cov_matrix": getattr(state, "cov_matrix", None),
+        "parties": getattr(state, "parties", PARTIES),
+    }
+
+
+def _dict_to_state(d: dict) -> AggregatorState:
+    """Reconstruct an AggregatorState from a plain dict."""
+    party_states = {
+        p: PartyState(mean=v["mean"], variance=v["variance"])
+        for p, v in d["party_states"].items()
+    }
+    state = AggregatorState(
+        last_date=d["last_date"],
+        party_states=party_states,
+        house_effects=d["house_effects"],
+        history=d["history"],
+    )
+    state.cov_matrix = d.get("cov_matrix")  # type: ignore[attr-defined]
+    state.parties = d.get("parties", PARTIES)  # type: ignore[attr-defined]
+    return state
+
+
 def load_state() -> AggregatorState:
     """Load the persisted aggregator state."""
     if not STATE_PATH.exists():
@@ -467,7 +502,11 @@ def load_state() -> AggregatorState:
             f"{STATE_PATH} not found. Run aggregate() or python -m src.aggregator first."
         )
     with open(STATE_PATH, "rb") as f:
-        return pickle.load(f)
+        raw = pickle.load(f)
+    # Support both new dict format and old pickled-dataclass format
+    if isinstance(raw, dict):
+        return _dict_to_state(raw)
+    return raw  # backwards compat for any old .pkl files
 
 
 def current_estimates(state: AggregatorState) -> dict[str, dict[str, float]]:

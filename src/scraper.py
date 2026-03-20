@@ -96,49 +96,90 @@ def _parse_share(raw) -> float | None:
         return None
 
 
-def _parse_date_range(raw: str) -> tuple[str | None, str | None]:
+def _parse_date_range(raw: str, default_year: int | None = None) -> tuple[str | None, str | None]:
     """
-    Parse a fieldwork date string like "1–5 Jan 2026" or "Jan 2026".
+    Parse a fieldwork date string like "1–5 Jan 2026", "18 Mar", "13–16 Mar".
     Returns (start_str, end_str) as ISO date strings, or (None, None) on failure.
+
+    Wikipedia polling tables often omit the year for recent polls. When no year
+    is found, `default_year` is used (caller should pass the current year).
+    If the inferred date would be in the future, the prior year is tried.
     """
+    import datetime as _dt
     raw = _strip_footnotes(str(raw)).strip()
     if not raw or raw in ("—", "-"):
         return None, None
 
-    # Normalise en-dash / em-dash to ASCII hyphen
-    raw = raw.replace("\u2013", "-").replace("\u2014", "-")
+    # Normalise en-dash / em-dash and non-breaking hyphens to ASCII hyphen
+    raw = raw.replace("\u2013", "-").replace("\u2014", "-").replace("\u2010", "-")
+    # Remove any stray Unicode replacement characters
+    raw = re.sub(r"[\ufffd\x00-\x08\x0b-\x1f]", "", raw)
 
-    # Attempt several patterns
+    today = _dt.date.today()
+    yr = default_year or today.year
+
+    def _infer_year(month_str: str, day: int) -> int:
+        """Return year such that the resulting date is not in the future."""
+        m = int(_month(month_str))
+        candidate = _dt.date(yr, m, min(day, 28))
+        if candidate > today:
+            return yr - 1
+        return yr
+
+    # Attempt patterns in order of specificity
     patterns = [
-        # "1-5 Jan 2026"
-        (r"(\d{1,2})-(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})",
-         lambda m: (
-             f"{m.group(4)}-{_month(m.group(3))}-{int(m.group(1)):02d}",
-             f"{m.group(4)}-{_month(m.group(3))}-{int(m.group(2)):02d}",
-         )),
-        # "28 Jan-2 Feb 2026"
-        (r"(\d{1,2})\s+([A-Za-z]+)-(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})",
-         lambda m: (
-             f"{m.group(5)}-{_month(m.group(2))}-{int(m.group(1)):02d}",
-             f"{m.group(5)}-{_month(m.group(4))}-{int(m.group(3)):02d}",
-         )),
-        # "28 Dec 2025-2 Jan 2026"
-        (r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})-(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})",
+        # "28 Dec 2025-2 Jan 2026" (cross-year range with both years explicit)
+        (r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\s*-\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})",
          lambda m: (
              f"{m.group(3)}-{_month(m.group(2))}-{int(m.group(1)):02d}",
              f"{m.group(6)}-{_month(m.group(5))}-{int(m.group(4)):02d}",
          )),
-        # "5 Jan 2026" (single date)
+        # "28 Jan-2 Feb 2026" (cross-month range, one year)
+        (r"(\d{1,2})\s+([A-Za-z]+)\s*-\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})",
+         lambda m: (
+             f"{m.group(5)}-{_month(m.group(2))}-{int(m.group(1)):02d}",
+             f"{m.group(5)}-{_month(m.group(4))}-{int(m.group(3)):02d}",
+         )),
+        # "1-5 Jan 2026" (same-month range with year)
+        (r"(\d{1,2})\s*-\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})",
+         lambda m: (
+             f"{m.group(4)}-{_month(m.group(3))}-{int(m.group(1)):02d}",
+             f"{m.group(4)}-{_month(m.group(3))}-{int(m.group(2)):02d}",
+         )),
+        # "5 Jan 2026" (single date with year)
         (r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})",
          lambda m: (
              f"{m.group(3)}-{_month(m.group(2))}-{int(m.group(1)):02d}",
              f"{m.group(3)}-{_month(m.group(2))}-{int(m.group(1)):02d}",
          )),
-        # "Jan 2026" (month only)
+        # "Jan 2026" (month only, with year)
         (r"([A-Za-z]+)\s+(\d{4})",
          lambda m: (
              f"{m.group(2)}-{_month(m.group(1))}-01",
              f"{m.group(2)}-{_month(m.group(1))}-28",
+         )),
+        # "14 Dec-9 Jan" (cross-month range, no year) — end month determines year
+        (r"(\d{1,2})\s+([A-Za-z]+)\s*-\s*(\d{1,2})\s+([A-Za-z]+)$",
+         lambda m: (
+             lambda end_y=_infer_year(m.group(4), int(m.group(3))),
+                    start_m=_month(m.group(2)), start_d=int(m.group(1)),
+                    end_m=_month(m.group(4)), end_d=int(m.group(3)):
+             # If start month > end month, start is previous year
+             (f"{end_y if int(start_m) <= int(end_m) else end_y-1}-{start_m}-{start_d:02d}",
+              f"{end_y}-{end_m}-{end_d:02d}")
+         )(),
+        ),
+        # "1-5 Mar" (same-month range, no year)
+        (r"(\d{1,2})\s*-\s*(\d{1,2})\s+([A-Za-z]+)$",
+         lambda m: (
+             f"{_infer_year(m.group(3), int(m.group(2)))}-{_month(m.group(3))}-{int(m.group(1)):02d}",
+             f"{_infer_year(m.group(3), int(m.group(2)))}-{_month(m.group(3))}-{int(m.group(2)):02d}",
+         )),
+        # "18 Mar" (single date, no year)
+        (r"(\d{1,2})\s+([A-Za-z]+)$",
+         lambda m: (
+             f"{_infer_year(m.group(2), int(m.group(1)))}-{_month(m.group(2))}-{int(m.group(1)):02d}",
+             f"{_infer_year(m.group(2), int(m.group(1)))}-{_month(m.group(2))}-{int(m.group(1)):02d}",
          )),
     ]
 
@@ -146,7 +187,9 @@ def _parse_date_range(raw: str) -> tuple[str | None, str | None]:
         match = re.search(pattern, raw, re.IGNORECASE)
         if match:
             try:
-                return extractor(match)
+                result = extractor(match)
+                if result[0] and result[1]:
+                    return result
             except Exception:
                 continue
 
@@ -189,9 +232,18 @@ def _fetch_html(force_refresh: bool = False) -> str:
 # ---------------------------------------------------------------------------
 
 def _normalise_col(col: str) -> str:
-    """Flatten a potentially multi-level column name to a single lowercase string."""
+    """Flatten a potentially multi-level column name to a single lowercase string.
+
+    Wikipedia polling tables produce MultiIndex columns like
+    ('Lab', 'Unnamed: 5_level_1') where only the first element is meaningful.
+    We use the first non-nan, non-Unnamed element.
+    """
     if isinstance(col, tuple):
-        col = " ".join(str(c) for c in col if str(c) != "nan")
+        meaningful = [
+            str(c) for c in col
+            if str(c).lower() != "nan" and "unnamed" not in str(c).lower()
+        ]
+        col = meaningful[0] if meaningful else str(col[0])
     return re.sub(r"\s+", " ", str(col)).strip().lower()
 
 
@@ -259,7 +311,7 @@ def _parse_tables(html: str) -> pd.DataFrame:
         for c in col_names:
             if c in (pollster_col, date_col, n_col):
                 continue
-            if any(skip in c for skip in ("lead", "change", "unnamed", "±")):
+            if any(skip in c for skip in ("lead", "change", "±")):
                 continue
             key = _identify_party_col(c)
             if key is not None:
@@ -281,7 +333,7 @@ def _parse_tables(html: str) -> pd.DataFrame:
                 continue
 
             date_raw = str(row.get(date_col, ""))
-            start_str, end_str = _parse_date_range(date_raw)
+            start_str, end_str = _parse_date_range(date_raw, default_year=pd.Timestamp.now().year)
             if end_str is None:
                 logger.debug("Skipping row, could not parse date: %r", date_raw)
                 continue
@@ -354,13 +406,42 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values("fieldwork_end").reset_index(drop=True)
 
     # Validate: require at least Lab + Con shares for a row to be useful
-    df = df[df["lab"].notna() | df["con"].notna()]
+    df = df[df["lab"].notna() & df["con"].notna()]
 
     # Clip any absurd values to [0, 100]
     for p in PARTIES:
         if p in df.columns:
             df[p] = df[p].clip(0, 100)
 
+    # -----------------------------------------------------------------------
+    # Filter out non-GB-wide polls (Scotland-only, Wales-only, leadership
+    # approval tables, etc.). Heuristics:
+    #   1. At least three of the four main GB parties must be present:
+    #      Lab, Con, Reform, LD.
+    #   2. The sum of Lab + Con + Reform + LD must be >= 50 pp
+    #      (subsample tables have inflated regional party shares).
+    #   3. No single party share > 60 pp (rules out devolved-region tables
+    #      where SNP/PC can dominate).
+    #   4. Lab and Con must each be <= 55 pp (plausible GB range).
+    # -----------------------------------------------------------------------
+    four_party_cols = [p for p in ("lab", "con", "reform", "ld") if p in df.columns]
+    four_party_sum = df[four_party_cols].sum(axis=1, min_count=3)
+    df = df[four_party_sum >= 50]
+
+    for p in PARTIES:
+        if p in df.columns:
+            df = df[df[p].isna() | (df[p] <= 60)]
+
+    df = df[df["lab"] <= 55]
+    df = df[df["con"] <= 55]
+
+    # Exclude Scotland-only subsamples (SNP > 12 pp) and Wales-only (PC > 8 pp)
+    if "snp" in df.columns:
+        df = df[df["snp"].isna() | (df["snp"] <= 12)]
+    if "pc" in df.columns:
+        df = df[df["pc"].isna() | (df["pc"] <= 8)]
+
+    df = df.reset_index(drop=True)
     logger.info("Final cleaned dataset: %d polls", len(df))
     return df
 
