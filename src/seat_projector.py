@@ -280,26 +280,40 @@ def project(
     logger.info("Drawing %d Monte Carlo samples …", n_draws)
     national_samples = _sample_national_shares(state, n_draws, parties)
 
-    # Storage for seat count distributions
     mrp_counts = {p: [] for p in parties} if mrp_available else {}
     ml_counts = {p: [] for p in parties} if ml_available else {}
 
     n_seats_total = len(mrp_shares_df) if mrp_available else len(ml_shares_df)
+    n_parties = len(parties)
+
+    # Per-seat Monte Carlo draws (float32: ~200MB per model at 10k x 650 x 8)
+    # kept so we can compute constituency-level share CIs and win probabilities
+    # after the loop for the interactive map.
+    mrp_draws = np.zeros((n_draws, n_seats_total, n_parties), dtype=np.float32) if mrp_available else None
+    ml_draws = np.zeros((n_draws, n_seats_total, n_parties), dtype=np.float32) if ml_available else None
+    mrp_win_counts = np.zeros((n_seats_total, n_parties), dtype=np.int32) if mrp_available else None
+    ml_win_counts = np.zeros((n_seats_total, n_parties), dtype=np.int32) if ml_available else None
+
+    seat_idx = np.arange(n_seats_total)
 
     for i in range(n_draws):
-        draw = national_samples[i]  # (n_parties,)
+        draw = national_samples[i]
 
         if mrp_available:
             scaled = _scale_constituency_shares(mrp_shares_df, draw, parties, electorate)
-            counts = _fptp_seat_counts(scaled, parties)
-            for p in parties:
-                mrp_counts[p].append(counts.get(p, 0))
+            mrp_draws[i] = scaled.astype(np.float32, copy=False)
+            winners = np.argmax(scaled, axis=1)
+            mrp_win_counts[seat_idx, winners] += 1
+            for j, p in enumerate(parties):
+                mrp_counts[p].append(int(np.sum(winners == j)))
 
         if ml_available:
             scaled = _scale_constituency_shares(ml_shares_df, draw, parties, electorate)
-            counts = _fptp_seat_counts(scaled, parties)
-            for p in parties:
-                ml_counts[p].append(counts.get(p, 0))
+            ml_draws[i] = scaled.astype(np.float32, copy=False)
+            winners = np.argmax(scaled, axis=1)
+            ml_win_counts[seat_idx, winners] += 1
+            for j, p in enumerate(parties):
+                ml_counts[p].append(int(np.sum(winners == j)))
 
         if (i + 1) % 2000 == 0:
             logger.info("  %d / %d draws complete", i + 1, n_draws)
@@ -335,9 +349,70 @@ def project(
         for p, v in sorted(proj.items(), key=lambda x: -x[1]["mean"]):
             logger.info("  %-10s %d [%d–%d]", p.upper(), v["mean"], v["lo90"], v["hi90"])
 
+    # Build per-constituency outputs for the interactive map.
+    meta_ref = mrp_shares_df if mrp_available else ml_shares_df
+    codes = meta_ref["constituency_code"].astype(str).tolist()
+    names = (
+        meta_ref["constituency_name"].astype(str).tolist()
+        if "constituency_name" in meta_ref.columns
+        else codes
+    )
+    regions = (
+        meta_ref["region_label"].astype(str).tolist()
+        if "region_label" in meta_ref.columns
+        else [""] * n_seats_total
+    )
+
+    def _per_seat_payloads(draws: np.ndarray, win_counts: np.ndarray) -> tuple[dict, dict]:
+        lo = np.percentile(draws, CI_LO, axis=0)
+        hi = np.percentile(draws, CI_HI, axis=0)
+        mean = draws.mean(axis=0)
+        win_prob = win_counts / max(n_draws, 1)
+        prob_by_seat: dict[str, dict] = {}
+        shares_by_seat: dict[str, dict] = {}
+        for s in range(n_seats_total):
+            code = codes[s]
+            prob_by_seat[code] = {
+                "name": names[s],
+                "region": regions[s],
+                "probs": {
+                    parties[j]: round(float(win_prob[s, j]), 4)
+                    for j in range(n_parties)
+                    if win_prob[s, j] > 0
+                },
+            }
+            shares_by_seat[code] = {
+                "name": names[s],
+                "region": regions[s],
+                "shares": {
+                    parties[j]: {
+                        "mean": round(float(mean[s, j]), 4),
+                        "lo90": round(float(lo[s, j]), 4),
+                        "hi90": round(float(hi[s, j]), 4),
+                    }
+                    for j in range(n_parties)
+                    if mean[s, j] > 0.001
+                },
+            }
+        return prob_by_seat, shares_by_seat
+
+    seat_probabilities: dict[str, dict] = {}
+    seat_shares: dict[str, dict] = {}
+    if mrp_available:
+        prob, shares = _per_seat_payloads(mrp_draws, mrp_win_counts)
+        seat_probabilities["mrp"] = prob
+        seat_shares["mrp"] = shares
+    if ml_available:
+        prob, shares = _per_seat_payloads(ml_draws, ml_win_counts)
+        seat_probabilities["ml"] = prob
+        seat_shares["ml"] = shares
+
     return {
         "seat_projections": seat_projections,
         "marginals": marginals,
+        "seat_probabilities": seat_probabilities,
+        "seat_shares": seat_shares,
+        "n_draws": n_draws,
         "raw_mrp_counts": mrp_counts,
         "raw_ml_counts": ml_counts,
     }

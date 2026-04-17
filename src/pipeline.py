@@ -92,6 +92,9 @@ def run(full: bool = False) -> None:
     seat_projections = {}
     marginals: list[dict] = []
     seat_history_entry: dict | None = None
+    seat_probabilities: dict = {}
+    seat_shares: dict = {}
+    mc_n_draws: int | None = None
 
     if mrp_available or ml_available:
         logger.info("Step 5: Running Monte Carlo seat projections …")
@@ -100,6 +103,9 @@ def run(full: bool = False) -> None:
             proj_result = project(mrp_available=mrp_available, ml_available=ml_available)
             seat_projections = proj_result["seat_projections"]
             marginals = proj_result["marginals"]
+            seat_probabilities = proj_result.get("seat_probabilities") or {}
+            seat_shares = proj_result.get("seat_shares") or {}
+            mc_n_draws = proj_result.get("n_draws")
 
             # Build seat history entry (weekly, keyed by ISO week)
             iso_week = date.today().isocalendar()
@@ -123,6 +129,9 @@ def run(full: bool = False) -> None:
         seat_projections=seat_projections or None,
         marginals=marginals or None,
         seat_history_entry=seat_history_entry,
+        seat_probabilities=seat_probabilities or None,
+        seat_shares=seat_shares or None,
+        n_draws=mc_n_draws,
     )
 
     logger.info("=" * 60)

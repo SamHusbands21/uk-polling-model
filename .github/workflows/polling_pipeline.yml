@@ -2,7 +2,7 @@ name: UK Polling Pipeline
 
 on:
   schedule:
-    # Every Sunday at 09:00 UTC → updates visible Monday morning UK time
+    # Every Sunday at 09:00 UTC -> updates visible Monday morning UK time
     - cron: '0 9 * * 0'
   workflow_dispatch:
     # Allow manual trigger from GitHub Actions UI
@@ -16,31 +16,38 @@ on:
           - 'false'
           - 'true'
 
+env:
+  # Private repo that hosts bes_2024.csv and results_2024.csv as release assets.
+  # Kept separate from the (public) model repo so the BES microdata is never
+  # world-downloadable. Refreshing the data: push new CSVs to a new release tag
+  # in DATA_REPO and bump DATA_RELEASE_TAG below.
+  DATA_REPO: SamHusbands21/uk-polling-data
+  DATA_RELEASE_TAG: polling-data-v1
+
 jobs:
   run_pipeline:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
-      # ── 1. Check out this repo (uk-polling-model) ─────────────────────────
+      # -- 1. Check out this repo (uk-polling-model) ------------------------
       - name: Checkout polling model repo
         uses: actions/checkout@v4
         with:
-          # Fetch full history so we can restore cached data
           fetch-depth: 1
 
-      # ── 2. Set up Python ──────────────────────────────────────────────────
+      # -- 2. Set up Python --------------------------------------------------
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
 
-      # ── 3. Install dependencies ───────────────────────────────────────────
+      # -- 3. Install dependencies ------------------------------------------
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── 4. Restore cached pipeline state (avoids full refit every week) ───
+      # -- 4. Restore cached pipeline state (avoids full refit every week) --
       - name: Restore pipeline cache
         uses: actions/cache@v4
         with:
@@ -55,7 +62,26 @@ jobs:
           restore-keys: |
             pipeline-state-${{ runner.os }}-
 
-      # ── 5. Run the pipeline ───────────────────────────────────────────────
+      # -- 5. Download BES + 2024 results from the data release -------------
+      # The CSVs live on a GitHub Release in the PRIVATE uk-polling-data repo
+      # (gitignored locally, never committed anywhere public). We use a
+      # fine-grained PAT (POLLING_DATA_TOKEN) with Contents:Read on that repo.
+      - name: Download polling-model data assets
+        env:
+          GH_TOKEN: ${{ secrets.POLLING_DATA_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          echo "Fetching release ${DATA_RELEASE_TAG} from ${DATA_REPO}..."
+          gh release download "${DATA_RELEASE_TAG}" \
+            --repo "${DATA_REPO}" \
+            --pattern 'bes_2024.csv' \
+            --pattern 'results_2024.csv' \
+            --dir data \
+            --clobber
+          ls -lh data/bes_2024.csv data/results_2024.csv
+
+      # -- 6. Run the pipeline ----------------------------------------------
       - name: Run polling pipeline
         run: |
           FULL_ARG=""
@@ -66,7 +92,7 @@ jobs:
         env:
           PYTHONPATH: .
 
-      # ── 6. Check if outputs changed ───────────────────────────────────────
+      # -- 7. Check if outputs changed --------------------------------------
       - name: Check for new outputs
         id: check_outputs
         run: |
@@ -77,36 +103,46 @@ jobs:
             echo "No outputs generated - skipping website push."
           fi
 
-      # ── 7. Push outputs to sam_website repo ──────────────────────────────
+      # -- 8. Push outputs to sam_website repo ------------------------------
       # Requires a fine-grained PAT (WEBSITE_DEPLOY_TOKEN) with:
       #   Repository: SamHusbands21.github.io
-      #   Permission: Contents → Read and Write
+      #   Permission: Contents -> Read and Write
       - name: Push outputs to website repo
         if: steps.check_outputs.outputs.has_outputs == 'true'
         run: |
-          # Configure git identity
+          set -euo pipefail
+
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
 
-          # Clone the website repo using the deploy token
           git clone \
             "https://x-access-token:${{ secrets.WEBSITE_DEPLOY_TOKEN }}@github.com/SamHusbands21/SamHusbands21.github.io.git" \
             /tmp/website
 
-          # Copy all output files to the website data/ directory
+          # Required file: always copy.
           cp output/polling_predictions.json /tmp/website/data/polling_predictions.json
 
-          for img in vote_share_trend.png seat_distribution.png model_comparison.png; do
-            if [ -f "output/$img" ]; then
-              cp "output/$img" "/tmp/website/data/$img"
-              echo "Copied $img"
+          # Optional artefacts: copy if present.
+          for artefact in \
+              vote_share_trend.png \
+              seat_distribution.png \
+              model_comparison.png \
+              seat_probabilities.json \
+              seat_shares.json; do
+            if [ -f "output/${artefact}" ]; then
+              cp "output/${artefact}" "/tmp/website/data/${artefact}"
+              echo "Copied ${artefact}"
             fi
           done
 
-          # Commit and push (only if there are changes)
           cd /tmp/website
           git add data/polling_predictions.json
-          git add data/vote_share_trend.png data/seat_distribution.png data/model_comparison.png 2>/dev/null || true
+          git add \
+            data/vote_share_trend.png \
+            data/seat_distribution.png \
+            data/model_comparison.png \
+            data/seat_probabilities.json \
+            data/seat_shares.json 2>/dev/null || true
 
           if git diff --cached --quiet; then
             echo "No changes to commit - website already up to date."
@@ -123,7 +159,7 @@ jobs:
             echo "Pushed to SamHusbands21.github.io"
           fi
 
-      # ── 8. Save updated pipeline state to cache ───────────────────────────
+      # -- 9. Save updated pipeline state to cache --------------------------
       - name: Save pipeline cache
         if: always()
         uses: actions/cache@v4

@@ -299,6 +299,9 @@ def generate(
     seat_projections: dict | None = None,
     marginals: list[dict] | None = None,
     seat_history_entry: dict | None = None,
+    seat_probabilities: dict | None = None,
+    seat_shares: dict | None = None,
+    n_draws: int | None = None,
 ) -> dict:
     """
     Generate all output artefacts. Returns the final JSON payload.
@@ -306,6 +309,9 @@ def generate(
     seat_projections: output from seat_projector.project() — None in Phase 1
     marginals: list of top marginal seats — None in Phase 1
     seat_history_entry: {"week": "2026-W12", "mrp": {...}, "ml": {...}} — None in Phase 1
+    seat_probabilities: per-constituency win probabilities for the interactive map.
+    seat_shares: per-constituency share stats (mean + 90% CI) for the map.
+    n_draws: number of Monte Carlo draws used (recorded in the probabilities file).
     """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -381,6 +387,30 @@ def generate(
     with open(JSON_OUT, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     logger.info("Wrote polling_predictions.json (%d history entries)", len(merged_history))
+
+    # Per-constituency artefacts for the interactive map.
+    # Written only when fresh data is provided; stale side-files are left untouched
+    # so the site keeps working if a single run fails to produce projections.
+    if seat_probabilities:
+        probs_payload = {
+            "updated_at": payload["updated_at"],
+            "n_draws": n_draws or 0,
+            "models": seat_probabilities,
+        }
+        probs_path = OUTPUT_DIR / "seat_probabilities.json"
+        with open(probs_path, "w", encoding="utf-8") as f:
+            json.dump(probs_payload, f, ensure_ascii=False, separators=(",", ":"))
+        logger.info("Wrote seat_probabilities.json (%d bytes)", probs_path.stat().st_size)
+
+    if seat_shares:
+        shares_payload = {
+            "updated_at": payload["updated_at"],
+            "models": seat_shares,
+        }
+        shares_path = OUTPUT_DIR / "seat_shares.json"
+        with open(shares_path, "w", encoding="utf-8") as f:
+            json.dump(shares_payload, f, ensure_ascii=False, separators=(",", ":"))
+        logger.info("Wrote seat_shares.json (%d bytes)", shares_path.stat().st_size)
 
     # Generate charts
     if not smoothed_df.empty:
