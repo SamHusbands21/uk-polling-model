@@ -77,11 +77,20 @@ CI_Z = 1.645
 
 # Half-life (in days) for recency-weighting residuals when estimating
 # house effects. Polls from `HE_HALFLIFE_DAYS` ago contribute half as much
-# to a pollster's estimated bias as today's polls. 90 days ≈ one quarter;
-# pollsters re-weight and adjust methodology often enough that a pollster's
-# "bias" shifts over time, and without a decay a pollster's summer-2024
-# residuals swamp their 2026 behaviour.
-HE_HALFLIFE_DAYS = 90.0
+# to a pollster's estimated bias as today's polls. Shorter = more
+# responsive to current-era pollster methodology; longer = more stable.
+# 60 days gives YouGov's recent Green prints proper dominance over their
+# early-2025 residuals, which matters during fast-moving surges.
+HE_HALFLIFE_DAYS = 60.0
+
+# Half-life (in days) for down-weighting the actual poll observations fed
+# to the Kalman filter. Distinct from HE_HALFLIFE_DAYS: that one controls
+# the M-step house-effect estimation; this one controls how much each poll
+# pulls the latent in the E-step. A longer half-life than HE is correct —
+# observations are the filter's signal so we don't want to throw history
+# away, just lean slightly toward recent evidence. 180 days means polls
+# from ~6 months ago contribute half as much as today's.
+OBS_HALFLIFE_DAYS = 180.0
 
 # Sample-size weighting bounds. Each poll's weight is clip(n / 1000, LO, HI),
 # where n is the reported sample size. The lower bound stops tiny polls
@@ -214,14 +223,23 @@ def _build_daily_grid(
     Map polls to a daily grid, subtracting house effects.
 
     Returns (dates, obs_dict, weight_dict) where obs_dict[party] is the
-    sample-size-weighted mean of house-effect-corrected poll shares on each
-    day (NaN where no poll), and weight_dict is the total effective weight
-    on that day (sum of per-poll weights).
+    sample-size- and recency-weighted mean of house-effect-corrected poll
+    shares on each day (NaN where no poll), and weight_dict is the total
+    effective weight on that day (sum of per-poll weights).
 
-    Per-poll weight is clip(sample_size / 1000, 0.5, 3.0); polls without a
-    recorded sample size fall back to 1.0. This gives big MRP waves ~3x
-    the pull of a standard voting-intention poll (but no more), instead of
-    treating every poll identically as the previous simple-count did.
+    Per-poll weight is
+        sample_weight(n) * recency_weight(days_old),
+    where:
+      - sample_weight(n) = clip(n / 1000, 0.5, 3.0); polls without a recorded
+        sample size fall back to 1.0.
+      - recency_weight(d) = 0.5 ** (days_old / OBS_HALFLIFE_DAYS);
+        polls from ~6 months ago contribute half as much as today's.
+
+    Recency weighting here (on top of the filter's implicit forgetting via
+    process noise) is what actually lets the aggregator respond to fresh
+    evidence from a shifting market — especially for volatile parties like
+    Green — instead of being anchored by two years of stable historical
+    polls.
     """
     min_date = polls["fieldwork_end"].min()
     max_date = polls["fieldwork_end"].max()
@@ -241,7 +259,10 @@ def _build_daily_grid(
         t = date_idx[d]
         pollster = row["pollster"]
         he = house_effects.get(pollster, {})
-        w_poll = _poll_weight(row.get("sample_size"))
+        w_sample = _poll_weight(row.get("sample_size"))
+        days_old = max((max_date - d).days, 0)
+        w_recency = 0.5 ** (days_old / OBS_HALFLIFE_DAYS)
+        w_poll = w_sample * w_recency
         for p in PARTIES:
             val = row.get(p)
             if pd.isna(val) or val is None:
@@ -278,30 +299,30 @@ def _estimate_house_effects(
     """
     M-step: estimate each pollster's house effect as the RECENCY-WEIGHTED
     mean residual between their polls and the smoothed state on those poll
-    dates, then ANCHOR house effects so they sum to zero across the market
-    (poll-count-weighted) per party.
+    dates, then ANCHOR house effects so they have zero mean across
+    pollsters per party.
 
     Two mechanics layered on top of the raw mean residual:
 
-    1. Recency decay (HE_HALFLIFE_DAYS, default 90 days). Older residuals
+    1. Recency decay (HE_HALFLIFE_DAYS, default 60 days). Older residuals
        are exponentially down-weighted so a pollster's bias reflects their
        CURRENT behaviour, not their average over the full history. Stops
-       YouGov's 2024 near-zero residuals flattening their 2026 +8pp Green
+       YouGov's 2024 near-zero residuals flattening their 2026 +Green
        residuals.
 
-    2. Zero-mean anchoring. Without any constraint the joint {latent state,
-       house effects} posterior is underdetermined — the filter can add +3
-       pp to every pollster's HE and subtract 3 pp from the latent with no
-       penalty. In practice it drifts toward the most prolific pollsters'
-       centre of mass. Forcing the poll-count-weighted mean HE per party
-       to zero removes that degree of freedom and anchors the latent to
-       the market mean, where it belongs.
+    2. Zero-mean anchoring (uniform per pollster). Without any constraint
+       the joint {latent state, house effects} posterior is underdetermined
+       — the filter can add +3 pp to every pollster's HE and subtract 3 pp
+       from the latent with no penalty. Forcing the mean HE per party to
+       zero across pollsters removes that degree of freedom and anchors
+       the latent to the market mean. Each pollster counts equally (not
+       weighted by poll count); this is deliberate, so a high-frequency
+       pollster like Techne doesn't drag the anchor toward their own
+       methodological bias simply because they poll weekly.
     """
     date_idx = {d: i for i, d in enumerate(dates)}
     # residuals[pollster][party] = list of (weight, residual)
     residuals: dict[str, dict[str, list[tuple[float, float]]]] = {}
-    # Total polls per pollster (used for the anchoring weight)
-    poll_counts: dict[str, int] = {}
 
     last_date = dates.max() if len(dates) else pd.Timestamp.today().normalize()
 
@@ -313,8 +334,6 @@ def _estimate_house_effects(
         pollster = row["pollster"]
         if pollster not in residuals:
             residuals[pollster] = {p: [] for p in PARTIES}
-            poll_counts[pollster] = 0
-        poll_counts[pollster] += 1
 
         days_old = max((last_date - d).days, 0)
         recency_w = 0.5 ** (days_old / HE_HALFLIFE_DAYS)
@@ -344,25 +363,26 @@ def _estimate_house_effects(
                 sum(w * r for w, r in entries) / total_w
             )
 
-    # Second pass: anchor house effects to a zero poll-count-weighted mean
-    # per party. The offset we subtract gets implicitly absorbed into the
-    # next Kalman pass's latent state, which is the correct place for it.
+    # Second pass: anchor house effects to a zero mean per party across
+    # pollsters. Each pollster contributes EQUALLY to the anchor (one vote),
+    # regardless of how frequently they poll. This is a change from earlier
+    # logic that weighted by poll count — the problem with volume-weighting
+    # is that a single high-frequency pollster (Techne, 40+ polls in a year
+    # most of them near-identical) dominates the anchor and effectively
+    # drags the latent toward their methodological bias. Each pollster is
+    # an independent methodology; each should have roughly equal say in
+    # defining the "market centre". Pollsters with no poll for this party
+    # are excluded from the average. The offset we subtract gets absorbed
+    # into the next Kalman pass's latent state, which is the correct place
+    # for it.
     for p in PARTIES:
-        num = 0.0
-        den = 0.0
-        for ps, he in house_effects.items():
-            if p not in he:
-                continue
-            n = poll_counts.get(ps, 0)
-            if n <= 0:
-                continue
-            num += he[p] * n
-            den += n
-        if den > 0:
-            offset = num / den
-            for ps in house_effects:
-                if p in house_effects[ps]:
-                    house_effects[ps][p] -= offset
+        vals = [he[p] for he in house_effects.values() if p in he]
+        if not vals:
+            continue
+        offset = sum(vals) / len(vals)
+        for ps in house_effects:
+            if p in house_effects[ps]:
+                house_effects[ps][p] -= offset
 
     return house_effects
 
