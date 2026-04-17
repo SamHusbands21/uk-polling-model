@@ -48,6 +48,10 @@ jobs:
         run: pip install -r requirements.txt
 
       # -- 4. Restore cached pipeline state (avoids full refit every week) --
+      # NB: do NOT cache data/census_2021.csv — it is pulled fresh from the
+      # data release so a stale/partial cache can't silently shadow it. The
+      # cache previously held an incomplete census (missing Scottish rows)
+      # which caused every Scottish seat to predict Lab 100% in Monte Carlo.
       - name: Restore pipeline cache
         uses: actions/cache@v4
         with:
@@ -55,17 +59,18 @@ jobs:
             data/aggregator_state.pkl
             data/mrp_coefficients.pkl
             data/ml_model.joblib
-            data/census_2021.csv
             data/raw/
             data/processed/
           key: pipeline-state-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
           restore-keys: |
             pipeline-state-${{ runner.os }}-
 
-      # -- 5. Download BES + 2024 results from the data release -------------
+      # -- 5. Download structural data from the data release ----------------
       # The CSVs live on a GitHub Release in the PRIVATE uk-polling-data repo
       # (gitignored locally, never committed anywhere public). We use a
       # fine-grained PAT (POLLING_DATA_TOKEN) with Contents:Read on that repo.
+      # census_2021.csv and results_2024.csv are derived from public sources
+      # but live in the same release for a single canonical fetch step.
       - name: Download polling-model data assets
         env:
           GH_TOKEN: ${{ secrets.POLLING_DATA_TOKEN }}
@@ -77,9 +82,10 @@ jobs:
             --repo "${DATA_REPO}" \
             --pattern 'bes_2024.csv' \
             --pattern 'results_2024.csv' \
+            --pattern 'census_2021.csv' \
             --dir data \
             --clobber
-          ls -lh data/bes_2024.csv data/results_2024.csv
+          ls -lh data/bes_2024.csv data/results_2024.csv data/census_2021.csv
 
       # -- 6. Run the pipeline ----------------------------------------------
       - name: Run polling pipeline
@@ -128,7 +134,8 @@ jobs:
               seat_distribution.png \
               model_comparison.png \
               seat_probabilities.json \
-              seat_shares.json; do
+              seat_shares.json \
+              constituency_meta.json; do
             if [ -f "output/${artefact}" ]; then
               cp "output/${artefact}" "/tmp/website/data/${artefact}"
               echo "Copied ${artefact}"
@@ -142,7 +149,8 @@ jobs:
             data/seat_distribution.png \
             data/model_comparison.png \
             data/seat_probabilities.json \
-            data/seat_shares.json 2>/dev/null || true
+            data/seat_shares.json \
+            data/constituency_meta.json 2>/dev/null || true
 
           if git diff --cached --quiet; then
             echo "No changes to commit - website already up to date."
@@ -160,6 +168,7 @@ jobs:
           fi
 
       # -- 9. Save updated pipeline state to cache --------------------------
+      # census_2021.csv deliberately excluded — fetched fresh from release.
       - name: Save pipeline cache
         if: always()
         uses: actions/cache@v4
@@ -168,7 +177,6 @@ jobs:
             data/aggregator_state.pkl
             data/mrp_coefficients.pkl
             data/ml_model.joblib
-            data/census_2021.csv
             data/raw/
             data/processed/
           key: pipeline-state-${{ runner.os }}-${{ hashFiles('requirements.txt') }}

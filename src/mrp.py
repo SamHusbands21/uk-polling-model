@@ -573,6 +573,33 @@ def poststratify(
     census_df = pd.read_csv(CENSUS_PATH)
     results_df = pd.read_csv(RESULTS_PATH)
 
+    # Sanity check: census must cover every GB constituency. A partial census
+    # silently turns Scottish/Welsh seats into all-zero predictions (because
+    # merge left-joins produce NaN → fillna(0) downstream), which in turn makes
+    # argmax land on index 0 for every Monte Carlo draw. We caught this in
+    # April 2026 when the CI cache held an incomplete census and every Scottish
+    # seat forecast Lab 100%. Fail loudly instead.
+    gb_codes = results_df.loc[
+        results_df["constituency_code"].str.startswith(("E14", "S14", "W07")),
+        "constituency_code",
+    ].unique()
+    census_codes = set(census_df["constituency_code"].unique())
+    missing = [c for c in gb_codes if c not in census_codes]
+    if missing:
+        raise RuntimeError(
+            f"census_2021.csv is missing {len(missing)} GB constituencies "
+            f"(first 5: {missing[:5]}). Re-download the release asset or "
+            f"regenerate with src/census.py — partial census silently breaks "
+            f"MRP for the missing seats."
+        )
+    scot_in_census = sum(1 for c in census_codes if c.startswith("S14"))
+    if scot_in_census < 50:
+        raise RuntimeError(
+            f"census_2021.csv contains only {scot_in_census} Scottish "
+            f"constituencies (expected 57). MRP will silently zero out "
+            f"Scottish predictions — aborting."
+        )
+
     # Add region labels to results if missing
     if "region_label" not in results_df.columns:
         scotland_codes = results_df["constituency_code"].str.startswith("S")

@@ -176,42 +176,70 @@ def _fptp_seat_counts(shares_matrix: np.ndarray, parties: list[str]) -> dict[str
 # Marginals computation
 # ---------------------------------------------------------------------------
 
-def _compute_marginals(
-    mrp_shares_df: pd.DataFrame,
+def _compute_marginals_from_mc(
+    mean_shares: np.ndarray,
+    win_prob: np.ndarray,
+    codes: list[str],
+    names: list[str],
     parties: list[str],
     n_marginals: int = N_MARGINALS,
 ) -> list[dict]:
     """
-    Identify the most competitive seats: those where the margin between the
-    first and second party is smallest.
+    Identify the most competitive seats from Monte Carlo output. A seat's
+    "margin" here is the gap between the top two parties' *mean* simulated
+    shares — i.e. the forecast's view of tightness, not the pre-calibration
+    MRP point estimate.
 
-    Returns a list of dicts sorted by margin (ascending).
+    Using the MC draws (same data source as the map's per-seat panel) also
+    avoids a latent bug in the previous implementation, where
+    ``float(row.get(p, 0) or 0)`` silently coerced legitimate 0.0 shares to
+    the fallback via Python's ``or`` short-circuit, and where zero-row seats
+    produced a stable-sort artefact (alphabetical margin=0 rows).
+
+    Parameters
+    ----------
+    mean_shares : (n_seats, n_parties) array of mean simulated vote shares.
+    win_prob    : (n_seats, n_parties) array of P(seat winner = party).
+    codes, names: parallel lists aligned with ``mean_shares`` row order.
+    parties     : party labels aligned with ``mean_shares`` column order.
+
+    Returns
+    -------
+    List of dicts sorted by margin (ascending), truncated to ``n_marginals``.
     """
-    party_cols = [p for p in parties if p in mrp_shares_df.columns]
+    n_seats, n_parties = mean_shares.shape
+    if n_seats == 0 or n_parties < 2:
+        return []
+
+    # Winner and runner-up indices per seat via argpartition for speed.
+    order = np.argsort(-mean_shares, axis=1)
+    first_idx = order[:, 0]
+    second_idx = order[:, 1]
+
+    seat_range = np.arange(n_seats)
+    first_share = mean_shares[seat_range, first_idx]
+    second_share = mean_shares[seat_range, second_idx]
+    margin = first_share - second_share
+
+    p_leader = win_prob[seat_range, first_idx]
+
     rows = []
-
-    for _, row in mrp_shares_df.iterrows():
-        shares = {p: float(row.get(p, 0) or 0) for p in party_cols}
-        if not shares:
+    for s in range(n_seats):
+        # Skip zero-information seats (all-zero shares): these show up when
+        # a constituency falls outside the modelled universe (e.g. NI) and
+        # would otherwise dominate the "tightest" list with meaningless 0s.
+        if first_share[s] <= 0:
             continue
-
-        sorted_parties = sorted(shares.items(), key=lambda x: -x[1])
-        if len(sorted_parties) < 2:
-            continue
-
-        first_party, first_share = sorted_parties[0]
-        second_party, second_share = sorted_parties[1]
-        margin = first_share - second_share
-
         rows.append({
-            "constituency": row.get("constituency_name", row.get("constituency_code", "Unknown")),
-            "constituency_code": row.get("constituency_code", ""),
-            "incumbent": first_party,
-            "challenger": second_party,
-            "margin": round(margin, 4),
-            "swing_needed": round(margin / 2, 4),
-            "incumbent_share": round(first_share, 4),
-            "challenger_share": round(second_share, 4),
+            "constituency": names[s],
+            "constituency_code": codes[s],
+            "incumbent": parties[int(first_idx[s])],
+            "challenger": parties[int(second_idx[s])],
+            "margin": round(float(margin[s]), 4),
+            "swing_needed": round(float(margin[s]) / 2, 4),
+            "incumbent_share": round(float(first_share[s]), 4),
+            "challenger_share": round(float(second_share[s]), 4),
+            "p_win_leader": round(float(p_leader[s]), 4),
         })
 
     rows.sort(key=lambda x: x["margin"])
@@ -339,10 +367,6 @@ def project(
     if ml_available:
         seat_projections["ml"] = _summarise(ml_counts)
 
-    # Compute marginals from the mean MRP (or ML) shares
-    shares_ref_df = mrp_shares_df if mrp_available else ml_shares_df
-    marginals = _compute_marginals(shares_ref_df, parties, N_MARGINALS)
-
     # Log headline seat numbers
     for model_name, proj in seat_projections.items():
         logger.info("%s seat projections:", model_name.upper())
@@ -362,6 +386,24 @@ def project(
         if "region_label" in meta_ref.columns
         else [""] * n_seats_total
     )
+
+    # Compute marginals from the Monte Carlo mean shares — same data source
+    # as the map's per-seat panel. Prefer MRP when available (richer model),
+    # fall back to ML.
+    if mrp_available and mrp_draws is not None:
+        marginals = _compute_marginals_from_mc(
+            mrp_draws.mean(axis=0),
+            mrp_win_counts / max(n_draws, 1),
+            codes, names, parties, N_MARGINALS,
+        )
+    elif ml_available and ml_draws is not None:
+        marginals = _compute_marginals_from_mc(
+            ml_draws.mean(axis=0),
+            ml_win_counts / max(n_draws, 1),
+            codes, names, parties, N_MARGINALS,
+        )
+    else:
+        marginals = []
 
     def _per_seat_payloads(draws: np.ndarray, win_counts: np.ndarray) -> tuple[dict, dict]:
         lo = np.percentile(draws, CI_LO, axis=0)

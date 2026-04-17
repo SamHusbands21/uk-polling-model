@@ -116,6 +116,75 @@ def _append_seat_history(
 
 
 # ---------------------------------------------------------------------------
+# Constituency metadata (2024 baseline for the interactive map)
+# ---------------------------------------------------------------------------
+
+REGION_TO_COUNTRY = {
+    "scotland": "Scotland",
+    "wales": "Wales",
+    "london": "England",
+    "south east": "England",
+    "south west": "England",
+    "east of england": "England",
+    "east midlands": "England",
+    "west midlands": "England",
+    "north west": "England",
+    "north east": "England",
+    "yorkshire and the humber": "England",
+    "northern_ireland": "Northern Ireland",
+    "northern ireland": "Northern Ireland",
+}
+
+
+def _build_constituency_meta() -> dict[str, dict]:
+    """
+    Build a compact per-constituency lookup with the 2024 baseline. Used by the
+    side panel on the interactive map so the browser doesn't need to load the
+    ~150 KB results CSV. Keyed by constituency_code.
+    """
+    results_path = DATA_DIR / "results_2024.csv"
+    if not results_path.exists():
+        logger.info("results_2024.csv not present — skipping constituency_meta.json.")
+        return {}
+
+    df = pd.read_csv(results_path)
+    share_cols = [c for c in df.columns if c.endswith("_2024") and c not in
+                  ("electorate_2024", "valid_votes_2024")]
+    parties = [c.removesuffix("_2024") for c in share_cols]
+
+    meta: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        code = str(row["constituency_code"])
+        shares: dict[str, float] = {}
+        incumbent = None
+        top_share = -1.0
+        for p, col in zip(parties, share_cols):
+            val = row.get(col)
+            if pd.isna(val):
+                continue
+            share = float(val)
+            if share > 0.001:
+                shares[p] = round(share, 4)
+            if share > top_share:
+                top_share = share
+                incumbent = p
+
+        region = str(row.get("region_label", "")).strip().lower()
+        electorate = row.get("electorate_2024")
+        meta[code] = {
+            "name": str(row.get("constituency_name", code)),
+            "region": region,
+            "country": REGION_TO_COUNTRY.get(region, ""),
+            "electorate_2024": (
+                int(electorate) if pd.notna(electorate) else None
+            ),
+            "incumbent_2024": incumbent,
+            "shares_2024": shares,
+        }
+    return meta
+
+
+# ---------------------------------------------------------------------------
 # Vote-share trend chart
 # ---------------------------------------------------------------------------
 
@@ -411,6 +480,20 @@ def generate(
         with open(shares_path, "w", encoding="utf-8") as f:
             json.dump(shares_payload, f, ensure_ascii=False, separators=(",", ":"))
         logger.info("Wrote seat_shares.json (%d bytes)", shares_path.stat().st_size)
+
+    # Static 2024 baseline for the map side panel. Regenerated every run so
+    # boundary changes flow through automatically, but the payload itself only
+    # changes when results_2024.csv changes.
+    meta = _build_constituency_meta()
+    if meta:
+        meta_payload = {
+            "updated_at": payload["updated_at"],
+            "constituencies": meta,
+        }
+        meta_path = OUTPUT_DIR / "constituency_meta.json"
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta_payload, f, ensure_ascii=False, separators=(",", ":"))
+        logger.info("Wrote constituency_meta.json (%d bytes)", meta_path.stat().st_size)
 
     # Generate charts
     if not smoothed_df.empty:
