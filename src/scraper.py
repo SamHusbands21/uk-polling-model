@@ -68,6 +68,38 @@ NON_PARTY_COLS = {
     "lead", "change",
 }
 
+# Canonical pollster names. Wikipedia inconsistently spaces / renames some
+# firms across tables and over time (older tables say "FindOutNow", newer
+# ones "Find Out Now"; "Lord Ashcroft" vs "Lord Ashcroft Polls"). Without
+# canonicalisation the EM step in the aggregator estimates two conflicting
+# house effects for what is really one pollster, fragmenting its history and
+# corrupting the latent-state anchor.
+#
+# Keys are pre-lowered, whitespace-normalised lookups; values are the
+# canonical display form we want persisted everywhere downstream.
+POLLSTER_ALIASES: dict[str, str] = {
+    "findoutnow":             "Find Out Now",
+    "find out now":           "Find Out Now",
+    "lord ashcroft":          "Lord Ashcroft Polls",
+    "lord ashcroft polls":    "Lord Ashcroft Polls",
+    "we think":               "WeThink",
+    "wethink":                "WeThink",
+    "more in common":         "More in Common",
+    "morein common":          "More in Common",
+    "bmg":                    "BMG Research",
+    "bmg research":           "BMG Research",
+    "yougov":                 "YouGov",
+    "you gov":                "YouGov",
+    "jl partners":            "JL Partners",
+    "j l partners":           "JL Partners",
+    "freshwater":             "Freshwater Strategy",
+    "freshwater strategy":    "Freshwater Strategy",
+    "merlin":                 "Merlin Strategy",
+    "merlin strategy":        "Merlin Strategy",
+    "focal data":             "Focaldata",
+    "focaldata":              "Focaldata",
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -76,6 +108,19 @@ NON_PARTY_COLS = {
 def _strip_footnotes(val: str) -> str:
     """Remove Wikipedia footnote markers like [a], [1], [note 2] from a string."""
     return re.sub(r"\[[\w\s]+\]", "", str(val)).strip()
+
+
+def _canonical_pollster(name: str) -> str:
+    """
+    Return a canonical display name for a pollster, collapsing spelling and
+    spacing variants (e.g. "FindOutNow" / "Find Out Now" -> "Find Out Now").
+
+    Lookup is case-insensitive and whitespace-collapsed. Unknown pollsters
+    fall back to the stripped original, so this is conservative — we don't
+    merge anyone we don't explicitly know about.
+    """
+    cleaned = re.sub(r"\s+", " ", str(name)).strip()
+    return POLLSTER_ALIASES.get(cleaned.lower(), cleaned)
 
 
 def _parse_share(raw) -> float | None:
@@ -394,13 +439,25 @@ def _parse_tables(html: str) -> pd.DataFrame:
 
 def _clean(df: pd.DataFrame) -> pd.DataFrame:
     """Deduplicate, sort, and validate the combined polls DataFrame."""
+    # Canonicalise pollster names BEFORE dedup so that "FindOutNow" /
+    # "Find Out Now" (and friends) collapse into a single row per
+    # pollster/date/sample_size. Without this the aggregator's EM step
+    # estimates two conflicting house effects for what's really one firm.
+    before_canon = df["pollster"].nunique()
+    df = df.copy()
+    df["pollster"] = df["pollster"].map(_canonical_pollster)
+    after_canon = df["pollster"].nunique()
+    if after_canon < before_canon:
+        logger.info("Pollster canonicalisation: %d -> %d unique names",
+                    before_canon, after_canon)
+
     # Deduplicate on (pollster, fieldwork_end, sample_size)
     before = len(df)
     df = df.drop_duplicates(
         subset=["pollster", "fieldwork_end", "sample_size"],
         keep="first",
     )
-    logger.info("Deduplication: %d → %d rows", before, len(df))
+    logger.info("Deduplication: %d -> %d rows", before, len(df))
 
     # Sort by fieldwork end date
     df = df.sort_values("fieldwork_end").reset_index(drop=True)

@@ -47,12 +47,22 @@ SMOOTHED_PATH = PROCESSED_DIR / "smoothed_shares.parquet"
 # Process noise: how much the true support can move per day (std dev in pp)
 PROCESS_NOISE_STD = 0.15  # percentage points per day — used for major parties
 
-# Party-specific process noise overrides for regional/minor parties whose
-# true support changes more slowly (and whose polls are sparse + rounded)
+# Party-specific process noise overrides for parties whose true support
+# genuinely changes more slowly than GB-wide vote intent, OR whose polls
+# are sparse enough that the filter needs regularisation.
+#
+# SNP and Plaid both stay lower because their samples come from small
+# Scottish / Welsh sub-samples with heavy sampling noise — the low process
+# noise stops the filter chasing sub-sample jitter.
+#
+# Green used to be overridden to 0.10 with the comment "Greens can surge
+# but not as volatile as Reform". That assumption is no longer safe — once
+# Greens are a 15%+ party they can move as fast as the majors, and the
+# dampened override was actively preventing the filter from tracking the
+# 2026 surge through a disagreeing pollster market. Reverted to the default.
 PROCESS_NOISE_BY_PARTY: dict[str, float] = {
     "snp":    0.05,   # SNP polling is more stable; sparse Scottish sub-samples
     "pc":     0.02,   # Plaid Cymru is very stable; very sparse Welsh sub-samples
-    "green":  0.10,   # Greens can surge but not as volatile as Reform
 }
 
 # Observation noise: poll sampling error (std dev in pp)
@@ -64,6 +74,23 @@ EM_TOL = 1e-4  # max change in house-effect estimates across iterations
 
 # Confidence interval z-score (90% → 1.645)
 CI_Z = 1.645
+
+# Half-life (in days) for recency-weighting residuals when estimating
+# house effects. Polls from `HE_HALFLIFE_DAYS` ago contribute half as much
+# to a pollster's estimated bias as today's polls. 90 days ≈ one quarter;
+# pollsters re-weight and adjust methodology often enough that a pollster's
+# "bias" shifts over time, and without a decay a pollster's summer-2024
+# residuals swamp their 2026 behaviour.
+HE_HALFLIFE_DAYS = 90.0
+
+# Sample-size weighting bounds. Each poll's weight is clip(n / 1000, LO, HI),
+# where n is the reported sample size. The lower bound stops tiny polls
+# being ignored entirely; the upper bound stops a single 17k-sample YouGov
+# MRP from drowning the day's market entirely (it still gets ~3x a standard
+# 1k-sample poll, which is about right).
+SAMPLE_SIZE_WEIGHT_LO = 0.5
+SAMPLE_SIZE_WEIGHT_HI = 3.0
+SAMPLE_SIZE_WEIGHT_REF = 1000.0  # reference sample size = weight 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +185,27 @@ def _kalman_smooth(
 # EM + full aggregator
 # ---------------------------------------------------------------------------
 
+def _poll_weight(sample_size) -> float:
+    """
+    Convert a poll's sample size into a Kalman observation weight.
+
+    Kalman-optimal weighting is proportional to 1 / sampling-variance ~ n, so
+    we take n / REF and clip to [LO, HI] to stop a single MRP dominating and
+    to give small sub-sample polls some say. Missing or malformed sample
+    sizes fall back to 1.0 (treated as a standard 1k-sample poll).
+    """
+    if sample_size is None:
+        return 1.0
+    try:
+        n = float(sample_size)
+    except (TypeError, ValueError):
+        return 1.0
+    if not np.isfinite(n) or n <= 0:
+        return 1.0
+    raw = n / SAMPLE_SIZE_WEIGHT_REF
+    return float(np.clip(raw, SAMPLE_SIZE_WEIGHT_LO, SAMPLE_SIZE_WEIGHT_HI))
+
+
 def _build_daily_grid(
     polls: pd.DataFrame,
     house_effects: dict[str, dict[str, float]],
@@ -165,9 +213,15 @@ def _build_daily_grid(
     """
     Map polls to a daily grid, subtracting house effects.
 
-    Returns (dates, obs_dict, weight_dict) where obs_dict[party] is an array
-    of house-effect-corrected poll shares (NaN where no poll) and weight_dict
-    counts the effective number of polls per day.
+    Returns (dates, obs_dict, weight_dict) where obs_dict[party] is the
+    sample-size-weighted mean of house-effect-corrected poll shares on each
+    day (NaN where no poll), and weight_dict is the total effective weight
+    on that day (sum of per-poll weights).
+
+    Per-poll weight is clip(sample_size / 1000, 0.5, 3.0); polls without a
+    recorded sample size fall back to 1.0. This gives big MRP waves ~3x
+    the pull of a standard voting-intention poll (but no more), instead of
+    treating every poll identically as the previous simple-count did.
     """
     min_date = polls["fieldwork_end"].min()
     max_date = polls["fieldwork_end"].max()
@@ -175,7 +229,10 @@ def _build_daily_grid(
     T = len(dates)
     date_idx = {d: i for i, d in enumerate(dates)}
 
-    obs: dict[str, list[list[float]]] = {p: [[] for _ in range(T)] for p in PARTIES}
+    # Per day, per party: list of (weight, corrected_share) tuples
+    obs: dict[str, list[list[tuple[float, float]]]] = {
+        p: [[] for _ in range(T)] for p in PARTIES
+    }
 
     for _, row in polls.iterrows():
         d = row["fieldwork_end"]
@@ -184,12 +241,13 @@ def _build_daily_grid(
         t = date_idx[d]
         pollster = row["pollster"]
         he = house_effects.get(pollster, {})
+        w_poll = _poll_weight(row.get("sample_size"))
         for p in PARTIES:
             val = row.get(p)
             if pd.isna(val) or val is None:
                 continue
             corrected = float(val) - he.get(p, 0.0)
-            obs[p][t].append(corrected)
+            obs[p][t].append((w_poll, corrected))
 
     obs_arr: dict[str, np.ndarray] = {}
     wt_arr: dict[str, np.ndarray] = {}
@@ -198,10 +256,14 @@ def _build_daily_grid(
         o = np.full(T, np.nan)
         w = np.zeros(T)
         for t in range(T):
-            vals = obs[p][t]
-            if vals:
-                o[t] = float(np.mean(vals))
-                w[t] = float(len(vals))
+            entries = obs[p][t]
+            if not entries:
+                continue
+            total_w = sum(wi for wi, _ in entries)
+            if total_w <= 0:
+                continue
+            o[t] = sum(wi * v for wi, v in entries) / total_w
+            w[t] = total_w
         obs_arr[p] = o
         wt_arr[p] = w
 
@@ -214,11 +276,34 @@ def _estimate_house_effects(
     dates: pd.DatetimeIndex,
 ) -> dict[str, dict[str, float]]:
     """
-    M-step: estimate each pollster's house effect as the mean residual
-    between their polls and the smoothed state on those poll dates.
+    M-step: estimate each pollster's house effect as the RECENCY-WEIGHTED
+    mean residual between their polls and the smoothed state on those poll
+    dates, then ANCHOR house effects so they sum to zero across the market
+    (poll-count-weighted) per party.
+
+    Two mechanics layered on top of the raw mean residual:
+
+    1. Recency decay (HE_HALFLIFE_DAYS, default 90 days). Older residuals
+       are exponentially down-weighted so a pollster's bias reflects their
+       CURRENT behaviour, not their average over the full history. Stops
+       YouGov's 2024 near-zero residuals flattening their 2026 +8pp Green
+       residuals.
+
+    2. Zero-mean anchoring. Without any constraint the joint {latent state,
+       house effects} posterior is underdetermined — the filter can add +3
+       pp to every pollster's HE and subtract 3 pp from the latent with no
+       penalty. In practice it drifts toward the most prolific pollsters'
+       centre of mass. Forcing the poll-count-weighted mean HE per party
+       to zero removes that degree of freedom and anchors the latent to
+       the market mean, where it belongs.
     """
     date_idx = {d: i for i, d in enumerate(dates)}
-    residuals: dict[str, dict[str, list[float]]] = {}
+    # residuals[pollster][party] = list of (weight, residual)
+    residuals: dict[str, dict[str, list[tuple[float, float]]]] = {}
+    # Total polls per pollster (used for the anchoring weight)
+    poll_counts: dict[str, int] = {}
+
+    last_date = dates.max() if len(dates) else pd.Timestamp.today().normalize()
 
     for _, row in polls.iterrows():
         d = row["fieldwork_end"]
@@ -228,18 +313,56 @@ def _estimate_house_effects(
         pollster = row["pollster"]
         if pollster not in residuals:
             residuals[pollster] = {p: [] for p in PARTIES}
+            poll_counts[pollster] = 0
+        poll_counts[pollster] += 1
+
+        days_old = max((last_date - d).days, 0)
+        recency_w = 0.5 ** (days_old / HE_HALFLIFE_DAYS)
+
         for p in PARTIES:
             val = row.get(p)
             if pd.isna(val) or val is None:
                 continue
-            residuals[pollster][p].append(float(val) - smoothed[p][t])
+            residuals[pollster][p].append(
+                (recency_w, float(val) - smoothed[p][t])
+            )
 
+    # First pass: recency-weighted mean residual per pollster/party
     house_effects: dict[str, dict[str, float]] = {}
     for pollster, party_res in residuals.items():
         house_effects[pollster] = {}
         for p in PARTIES:
-            vals = party_res[p]
-            house_effects[pollster][p] = float(np.mean(vals)) if vals else 0.0
+            entries = party_res[p]
+            if not entries:
+                house_effects[pollster][p] = 0.0
+                continue
+            total_w = sum(w for w, _ in entries)
+            if total_w <= 0:
+                house_effects[pollster][p] = 0.0
+                continue
+            house_effects[pollster][p] = (
+                sum(w * r for w, r in entries) / total_w
+            )
+
+    # Second pass: anchor house effects to a zero poll-count-weighted mean
+    # per party. The offset we subtract gets implicitly absorbed into the
+    # next Kalman pass's latent state, which is the correct place for it.
+    for p in PARTIES:
+        num = 0.0
+        den = 0.0
+        for ps, he in house_effects.items():
+            if p not in he:
+                continue
+            n = poll_counts.get(ps, 0)
+            if n <= 0:
+                continue
+            num += he[p] * n
+            den += n
+        if den > 0:
+            offset = num / den
+            for ps in house_effects:
+                if p in house_effects[ps]:
+                    house_effects[ps][p] -= offset
 
     return house_effects
 
