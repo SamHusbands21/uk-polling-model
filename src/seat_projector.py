@@ -182,13 +182,13 @@ def _compute_marginals_from_mc(
     codes: list[str],
     names: list[str],
     parties: list[str],
+    incumbents_2024: dict[str, str] | None = None,
     n_marginals: int = N_MARGINALS,
 ) -> list[dict]:
     """
     Identify the most competitive seats from Monte Carlo output. A seat's
     "margin" here is the gap between the top two parties' *mean* simulated
-    shares — i.e. the forecast's view of tightness, not the pre-calibration
-    MRP point estimate.
+    shares — i.e. the forecast's view of tightness.
 
     Using the MC draws (same data source as the map's per-seat panel) also
     avoids a latent bug in the previous implementation, where
@@ -196,12 +196,26 @@ def _compute_marginals_from_mc(
     the fallback via Python's ``or`` short-circuit, and where zero-row seats
     produced a stable-sort artefact (alphabetical margin=0 rows).
 
+    Output semantics
+    ----------------
+    - ``leader`` / ``runner_up`` are the top-two FORECAST parties (from the MC
+      mean). These drive the tightness-of-race margin.
+    - ``incumbent_2024`` is the actual 2024 winner from the HoC results — NOT
+      the forecast leader. When ``leader != incumbent_2024`` that's a predicted
+      flip. This was a real footgun before: the old output called the forecast
+      leader "incumbent" so seats like Altrincham and Sale West (Lab held in
+      2024, Con nose-ahead in the MRP this week) displayed "Con incumbent",
+      which misrepresents the actual 2024 result.
+
     Parameters
     ----------
-    mean_shares : (n_seats, n_parties) array of mean simulated vote shares.
-    win_prob    : (n_seats, n_parties) array of P(seat winner = party).
-    codes, names: parallel lists aligned with ``mean_shares`` row order.
-    parties     : party labels aligned with ``mean_shares`` column order.
+    mean_shares     : (n_seats, n_parties) mean simulated vote shares.
+    win_prob        : (n_seats, n_parties) array of P(seat winner = party).
+    codes, names    : parallel lists aligned with ``mean_shares`` row order.
+    parties         : party labels aligned with ``mean_shares`` column order.
+    incumbents_2024 : optional mapping of constituency_code → party that won
+                      the seat in 2024. Parties outside ``parties`` (e.g. NI
+                      parties bucketed as ``others``) are accepted.
 
     Returns
     -------
@@ -211,7 +225,8 @@ def _compute_marginals_from_mc(
     if n_seats == 0 or n_parties < 2:
         return []
 
-    # Winner and runner-up indices per seat via argpartition for speed.
+    incumbents_2024 = incumbents_2024 or {}
+
     order = np.argsort(-mean_shares, axis=1)
     first_idx = order[:, 0]
     second_idx = order[:, 1]
@@ -230,20 +245,57 @@ def _compute_marginals_from_mc(
         # would otherwise dominate the "tightest" list with meaningless 0s.
         if first_share[s] <= 0:
             continue
+        code = codes[s]
+        leader = parties[int(first_idx[s])]
+        runner_up = parties[int(second_idx[s])]
         rows.append({
             "constituency": names[s],
-            "constituency_code": codes[s],
-            "incumbent": parties[int(first_idx[s])],
-            "challenger": parties[int(second_idx[s])],
+            "constituency_code": code,
+            "leader": leader,
+            "runner_up": runner_up,
+            "leader_share": round(float(first_share[s]), 4),
+            "runner_up_share": round(float(second_share[s]), 4),
             "margin": round(float(margin[s]), 4),
             "swing_needed": round(float(margin[s]) / 2, 4),
+            "p_win_leader": round(float(p_leader[s]), 4),
+            "incumbent_2024": incumbents_2024.get(code),
+            # Back-compat aliases — any downstream code still reading these
+            # gets the same semantics as before (forecast top-two) rather
+            # than a silent schema break.
+            "incumbent": leader,
+            "challenger": runner_up,
             "incumbent_share": round(float(first_share[s]), 4),
             "challenger_share": round(float(second_share[s]), 4),
-            "p_win_leader": round(float(p_leader[s]), 4),
         })
 
     rows.sort(key=lambda x: x["margin"])
     return rows[:n_marginals]
+
+
+def _load_incumbents_2024() -> dict[str, str]:
+    """
+    Return a mapping of constituency_code → 2024 winning party, derived from
+    ``data/results_2024.csv`` (the single source of truth for 2024 results).
+
+    Works across the 6 modelled parties (lab/con/ld/reform/green/snp/pc) and
+    buckets everything else as ``"others"`` — this matches the NI treatment
+    where DUP / Sinn Féin / Alliance votes are lumped into ``others_2024``.
+    Returns an empty dict if the file is missing (older runs shouldn't fail).
+    """
+    if not RESULTS_PATH.exists():
+        return {}
+    df = pd.read_csv(RESULTS_PATH)
+    share_cols = [c for c in df.columns
+                  if c.endswith("_2024") and c not in ("electorate_2024", "valid_votes_2024")]
+    if not share_cols:
+        return {}
+    parties = [c.removesuffix("_2024") for c in share_cols]
+    shares = df[share_cols].to_numpy(copy=False)
+    winners_idx = shares.argmax(axis=1)
+    return {
+        str(code): parties[int(idx)]
+        for code, idx in zip(df["constituency_code"].astype(str), winners_idx)
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -389,18 +441,25 @@ def project(
 
     # Compute marginals from the Monte Carlo mean shares — same data source
     # as the map's per-seat panel. Prefer MRP when available (richer model),
-    # fall back to ML.
+    # fall back to ML. The 2024 incumbents come from results_2024.csv so the
+    # marginals table can show the actual sitting party alongside the
+    # forecast leader (which may or may not be the same).
+    incumbents_2024 = _load_incumbents_2024()
     if mrp_available and mrp_draws is not None:
         marginals = _compute_marginals_from_mc(
             mrp_draws.mean(axis=0),
             mrp_win_counts / max(n_draws, 1),
-            codes, names, parties, N_MARGINALS,
+            codes, names, parties,
+            incumbents_2024=incumbents_2024,
+            n_marginals=N_MARGINALS,
         )
     elif ml_available and ml_draws is not None:
         marginals = _compute_marginals_from_mc(
             ml_draws.mean(axis=0),
             ml_win_counts / max(n_draws, 1),
-            codes, names, parties, N_MARGINALS,
+            codes, names, parties,
+            incumbents_2024=incumbents_2024,
+            n_marginals=N_MARGINALS,
         )
     else:
         marginals = []
