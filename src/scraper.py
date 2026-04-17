@@ -472,14 +472,27 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
 
     # -----------------------------------------------------------------------
     # Filter out non-GB-wide polls (Scotland-only, Wales-only, leadership
-    # approval tables, etc.). Heuristics:
-    #   1. At least three of the four main GB parties must be present:
-    #      Lab, Con, Reform, LD.
-    #   2. The sum of Lab + Con + Reform + LD must be >= 50 pp
-    #      (subsample tables have inflated regional party shares).
-    #   3. No single party share > 60 pp (rules out devolved-region tables
+    # approval tables, battleground / constituency-type sub-polls, etc.).
+    # Heuristics, layered from coarsest to finest:
+    #
+    #   1. At least three of the four main GB parties must be present
+    #      (Lab, Con, Reform, LD) and their combined share >= 50 pp.
+    #   2. No single party share > 60 pp (rules out devolved-region tables
     #      where SNP/PC can dominate).
-    #   4. Lab and Con must each be <= 55 pp (plausible GB range).
+    #   3. Lab and Con must each be <= 55 pp (plausible GB range).
+    #   4. Scotland-only (SNP > 12 pp) and Wales-only (PC > 8 pp) excluded.
+    #   5. TOTAL share across all recorded parties must sum to >= 90 pp.
+    #      Proper national polls sum to ~100%; YouGov's seat-type sub-polls
+    #      ("Blue Wall", "Lab target", "Con-Reform battleground") have
+    #      geographically filtered electorates that only sum to 65-82%
+    #      because the excluded share goes to "other/none/DK" inflated by
+    #      the filtering. This catches the class of sub-polls that pass
+    #      checks 1-4 (normal party mix, plausible shares) but aren't
+    #      actually national voting intent.
+    #   6. Sample size must be >= 500. Anything smaller is a sub-sample,
+    #      crosstab, or stunt poll. (NaN sample size is allowed through;
+    #      not every Wikipedia row records n, but no live voting-intention
+    #      pollster publishes national polls with n<500.)
     # -----------------------------------------------------------------------
     four_party_cols = [p for p in ("lab", "con", "reform", "ld") if p in df.columns]
     four_party_sum = df[four_party_cols].sum(axis=1, min_count=3)
@@ -492,11 +505,34 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     df = df[df["lab"] <= 55]
     df = df[df["con"] <= 55]
 
-    # Exclude Scotland-only subsamples (SNP > 12 pp) and Wales-only (PC > 8 pp)
     if "snp" in df.columns:
         df = df[df["snp"].isna() | (df["snp"] <= 12)]
     if "pc" in df.columns:
         df = df[df["pc"].isna() | (df["pc"] <= 8)]
+
+    # Filter 5: total shares sum >= 90
+    party_cols = [p for p in PARTIES if p in df.columns]
+    total_shares = df[party_cols].sum(axis=1, min_count=1)
+    before_sum = len(df)
+    df = df[total_shares >= 90]
+    dropped_sum = before_sum - len(df)
+    if dropped_sum > 0:
+        logger.info(
+            "Dropped %d rows whose party shares summed to < 90%% "
+            "(sub-polls / battleground / constituency-type samples)",
+            dropped_sum,
+        )
+
+    # Filter 6: minimum sample size
+    if "sample_size" in df.columns:
+        before_n = len(df)
+        df = df[df["sample_size"].isna() | (df["sample_size"] >= 500)]
+        dropped_n = before_n - len(df)
+        if dropped_n > 0:
+            logger.info(
+                "Dropped %d rows with sample_size < 500 (sub-samples / stunt polls)",
+                dropped_n,
+            )
 
     df = df.reset_index(drop=True)
     logger.info("Final cleaned dataset: %d polls", len(df))
