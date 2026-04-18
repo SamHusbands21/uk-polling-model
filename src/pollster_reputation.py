@@ -52,7 +52,6 @@ POLLSTER_TIER_1: set[str] = {
 }
 
 POLLSTER_TIER_2: set[str] = {
-    "Techne",
     "Find Out Now",
     "WeThink",
     "Focaldata",
@@ -64,6 +63,14 @@ POLLSTER_TIER_3: set[str] = {
     "Merlin Strategy",
     "Freshwater Strategy",
     "Lord Ashcroft Polls",
+    # Techne is BPC-accredited but demoted to Tier 3 because their weekly
+    # turnaround + sharp, persistent downward divergence from the wider
+    # market on Green (~8% mean vs ~15% BPC cohort) suggests a
+    # methodology that under-counts low-salience parties. The high poll
+    # volume (~40% of the dataset) means even a moderate bias dominates
+    # the filter, so they need both the reputation down-weight AND the
+    # volume cap in _build_daily_grid to stop overwhelming the signal.
+    "Techne",
 }
 
 TIER_WEIGHTS: dict[int, float] = {1: 1.00, 2: 0.60, 3: 0.30}

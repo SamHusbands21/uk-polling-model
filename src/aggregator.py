@@ -89,9 +89,22 @@ HE_HALFLIFE_DAYS = 60.0
 # the M-step house-effect estimation; this one controls how much each poll
 # pulls the latent in the E-step. A longer half-life than HE is correct —
 # observations are the filter's signal so we don't want to throw history
-# away, just lean slightly toward recent evidence. 180 days means polls
-# from ~6 months ago contribute half as much as today's.
-OBS_HALFLIFE_DAYS = 180.0
+# away, just lean slightly toward recent evidence. 90 days gives fresh
+# evidence of a shifting market (e.g. the post-Reform Green surge)
+# meaningful pull while still keeping enough history for stable filter
+# variance estimates.
+OBS_HALFLIFE_DAYS = 90.0
+
+# Soft cap on effective number of polls contributed by any single
+# pollster. Each of their polls is multiplied by min(1, CAP / n_polls),
+# where n_polls is that pollster's total contribution to the dataset.
+# Rationale: one weekly pollster (Techne, ~40 polls in a year) should
+# not be able to dominate the filter's E-step simply by out-publishing
+# the BPC core. With a cap of 12 a weekly pollster over a year counts
+# as ~12 fortnightly polls, which is roughly the right volume to match
+# the less-frequent Tier 1 houses that poll monthly. Set to a large
+# number to effectively disable.
+POLLSTER_VOLUME_CAP = 12.0
 
 # Sample-size weighting bounds. Each poll's weight is clip(n / 1000, LO, HI),
 # where n is the reported sample size. The lower bound stops tiny polls
@@ -229,16 +242,20 @@ def _build_daily_grid(
     effective weight on that day (sum of per-poll weights).
 
     Per-poll weight is
-        sample_weight(n) * recency_weight(days_old) * reputation_weight(pollster),
+        sample(n) * recency(days_old) * reputation(pollster) * volume_cap(pollster),
     where:
-      - sample_weight(n) = clip(n / 1000, 0.5, 3.0); polls without a recorded
+      - sample(n) = clip(n / 1000, 0.5, 3.0); polls without a recorded
         sample size fall back to 1.0.
-      - recency_weight(d) = 0.5 ** (days_old / OBS_HALFLIFE_DAYS);
-        polls from ~6 months ago contribute half as much as today's.
-      - reputation_weight(pollster) is the hand-curated tier weight from
+      - recency(d) = 0.5 ** (days_old / OBS_HALFLIFE_DAYS);
+        polls from ~3 months ago contribute half as much as today's.
+      - reputation(pollster) is the hand-curated tier weight from
         src/pollster_reputation.py (1.00 / 0.60 / 0.30 for tiers 1/2/3).
-        This stops high-volume low-reputation pollsters dominating the
-        filter simply by out-publishing BPC-accredited shops.
+      - volume_cap(pollster) = min(1, CAP / n_polls) where n_polls is the
+        pollster's total count in the dataset. Caps any single pollster's
+        effective contribution to ~CAP polls so a weekly publisher like
+        Techne can't drown out the less-frequent Tier 1 houses just by
+        out-publishing them. Reputation and volume are complementary:
+        reputation adjusts for quality, volume adjusts for dominance.
 
     Recency weighting here (on top of the filter's implicit forgetting via
     process noise) is what actually lets the aggregator respond to fresh
@@ -251,6 +268,16 @@ def _build_daily_grid(
     dates = pd.date_range(min_date, max_date, freq="D")
     T = len(dates)
     date_idx = {d: i for i, d in enumerate(dates)}
+
+    # Pre-compute per-pollster volume-cap scale factor. A pollster with
+    # more than POLLSTER_VOLUME_CAP polls in the dataset has each of
+    # their polls multiplied by CAP / n_polls, so their total effective
+    # contribution is at most CAP polls regardless of publication cadence.
+    pollster_counts = polls["pollster"].value_counts().to_dict()
+    volume_scale = {
+        ps: min(1.0, POLLSTER_VOLUME_CAP / n) if n > 0 else 1.0
+        for ps, n in pollster_counts.items()
+    }
 
     # Per day, per party: list of (weight, corrected_share) tuples
     obs: dict[str, list[list[tuple[float, float]]]] = {
@@ -268,7 +295,8 @@ def _build_daily_grid(
         days_old = max((max_date - d).days, 0)
         w_recency = 0.5 ** (days_old / OBS_HALFLIFE_DAYS)
         w_rep = reputation_weight(pollster)
-        w_poll = w_sample * w_recency * w_rep
+        w_vol = volume_scale.get(pollster, 1.0)
+        w_poll = w_sample * w_recency * w_rep * w_vol
         for p in PARTIES:
             val = row.get(p)
             if pd.isna(val) or val is None:
