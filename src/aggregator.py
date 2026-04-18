@@ -80,9 +80,26 @@ CI_Z = 1.645
 # house effects. Polls from `HE_HALFLIFE_DAYS` ago contribute half as much
 # to a pollster's estimated bias as today's polls. Shorter = more
 # responsive to current-era pollster methodology; longer = more stable.
-# 60 days gives YouGov's recent Green prints proper dominance over their
-# early-2025 residuals, which matters during fast-moving surges.
-HE_HALFLIFE_DAYS = 60.0
+# 30 days is aggressive — pollsters that have caught up with a shifting
+# market (e.g. More in Common moving from 8% to 13% on Green) see their
+# HE collapse toward zero within a couple of fresh polls, instead of
+# being dragged by a year of historical residuals. Makes the aggregator
+# genuinely tracking current-era pollster behaviour rather than
+# long-run averages.
+HE_HALFLIFE_DAYS = 30.0
+
+# Fraction of pollsters to trim from each end (by house-effect value)
+# before computing the zero-mean anchor. 0.10 means the most extreme
+# ~10% of pollsters on each side are dropped from the anchor calculation
+# for each party, which stops a single extreme-HE pollster (e.g. a
+# one-off poll from a Tier 1 house that happens to be a big outlier)
+# dragging the "market centre" for that party. The trim is applied on
+# top of reputation weighting — the trimmed-down pollsters still
+# contribute observations in the E-step, they just don't vote on where
+# zero sits. Falls back to untrimmed if there are fewer than
+# HE_ANCHOR_TRIM_MIN_N pollsters classified for the party.
+HE_ANCHOR_TRIM = 0.10
+HE_ANCHOR_TRIM_MIN_N = 5
 
 # Half-life (in days) for down-weighting the actual poll observations fed
 # to the Kalman filter. Distinct from HE_HALFLIFE_DAYS: that one controls
@@ -325,6 +342,36 @@ def _build_daily_grid(
     return dates, obs_arr, wt_arr
 
 
+def _trimmed_weighted_mean(
+    pairs: list[tuple[float, float]],
+    trim_frac: float = HE_ANCHOR_TRIM,
+    min_n_for_trim: int = HE_ANCHOR_TRIM_MIN_N,
+) -> float | None:
+    """
+    Weighted mean of `pairs` = [(value, weight), ...] with the most
+    extreme `trim_frac` fraction of pollsters dropped from each end
+    (after sorting by value).
+
+    The number of pollsters dropped per end is ``max(1, int(trim_frac * n))``
+    when ``n >= min_n_for_trim``; otherwise the function falls back to
+    the plain weighted mean so the anchor still works on sparse party
+    subsets (e.g. SNP / Plaid).
+    """
+    total_w = sum(w for _, w in pairs)
+    if total_w <= 0:
+        return None
+    n = len(pairs)
+    if n < min_n_for_trim:
+        return sum(v * w for v, w in pairs) / total_w
+    k = max(1, int(trim_frac * n))
+    sorted_pairs = sorted(pairs, key=lambda x: x[0])
+    middle = sorted_pairs[k:n - k]
+    mw = sum(w for _, w in middle)
+    if mw <= 0:
+        return sum(v * w for v, w in pairs) / total_w
+    return sum(v * w for v, w in middle) / mw
+
+
 def _estimate_house_effects(
     polls: pd.DataFrame,
     smoothed: dict[str, np.ndarray],
@@ -344,19 +391,30 @@ def _estimate_house_effects(
        YouGov's 2024 near-zero residuals flattening their 2026 +Green
        residuals.
 
-    2. Zero-mean anchoring (reputation-weighted). Without any constraint
-       the joint {latent state, house effects} posterior is underdetermined
-       — the filter can add +3 pp to every pollster's HE and subtract 3 pp
-       from the latent with no penalty. Forcing the mean HE per party to
-       zero across pollsters removes that degree of freedom and anchors
-       the latent to the market mean. Pollsters are weighted by their
-       reputation tier (1.00 / 0.60 / 0.30) rather than by poll count or
-       uniformly, so Tier 1 pollsters (YouGov, Ipsos, Opinium, …) have
-       disproportionate say in defining the "market centre" and Tier 3
-       pollsters (non-BPC / opaque / novel) still contribute signal but
-       can't drag the anchor toward their own methodological bias. If
-       every pollster were Tier 1 this reduces to the old uniform anchor,
-       so the change is safe if we ever disable reputation weighting.
+    2. Zero-mean anchoring (reputation-weighted, trimmed). Without any
+       constraint the joint {latent state, house effects} posterior is
+       underdetermined — the filter can add +3 pp to every pollster's HE
+       and subtract 3 pp from the latent with no penalty. Forcing the
+       mean HE per party to zero across pollsters removes that degree of
+       freedom and anchors the latent to the market centre. Two
+       refinements on the raw weighted mean:
+
+         a) Reputation weighting (1.00 / 0.60 / 0.30) so Tier 1 BPC
+            pollsters have disproportionate say over Tier 3 novel /
+            opaque ones.
+         b) Trimming — the most extreme ``HE_ANCHOR_TRIM`` fraction of
+            pollsters on each side (by HE value for this party) are
+            dropped from the anchor calculation. This stops a single
+            outlier pollster (e.g. a one-off poll with an unusually
+            extreme residual) dragging the market centre for that
+            party. Trimmed pollsters are NOT removed from the filter —
+            they still contribute observations in the E-step; they just
+            don't vote on where zero sits.
+
+       If trimming is disabled (`HE_ANCHOR_TRIM = 0`) this reduces to a
+       plain reputation-weighted mean, which itself reduces to a uniform
+       mean if every pollster has weight 1.0. So the anchor is a nested
+       set of refinements each safely disable-able.
     """
     date_idx = {d: i for i, d in enumerate(dates)}
     # residuals[pollster][party] = list of (weight, residual)
@@ -401,20 +459,16 @@ def _estimate_house_effects(
                 sum(w * r for w, r in entries) / total_w
             )
 
-    # Second pass: anchor house effects to a zero (reputation-weighted)
-    # mean per party across pollsters. Each pollster contributes according
-    # to its curated reputation tier (1.00 / 0.60 / 0.30), NOT its poll
-    # count and NOT uniformly. Rationale:
-    #   - Volume-weighting let a single high-frequency pollster (Techne,
-    #     40+ polls in a year) dominate the anchor and drag the latent
-    #     toward their methodological bias.
-    #   - Uniform-per-pollster was the previous fix but treats a new
-    #     non-BPC single-client outfit identically to YouGov, which is too
-    #     forgiving when non-mainstream pollsters disagree sharply with
-    #     the BPC core.
-    # Reputation-weighting respects that each pollster is an independent
-    # methodology but lets well-established BPC-accredited firms anchor
-    # more firmly. Pollsters with no poll for this party are excluded.
+    # Second pass: anchor house effects to a zero (reputation-weighted,
+    # trimmed) mean per party across pollsters. See docstring above for
+    # the full rationale; the key points are:
+    #   - Reputation weighting (1.00 / 0.60 / 0.30) stops a high-volume
+    #     low-reputation pollster drowning the anchor, AND stops
+    #     uniform-per-pollster treating a novel non-BPC shop identically
+    #     to YouGov.
+    #   - Trimming the top/bottom HE_ANCHOR_TRIM fraction of pollsters
+    #     by HE value removes single-poll outliers (e.g. Deltapoll on
+    #     Green) from the anchor without removing them from the filter.
     # The offset we subtract gets absorbed into the next Kalman pass's
     # latent state, which is the correct place for it.
     pollster_weights = {
@@ -428,10 +482,9 @@ def _estimate_house_effects(
         ]
         if not pairs:
             continue
-        total_w = sum(w for _, w in pairs)
-        if total_w <= 0:
+        offset = _trimmed_weighted_mean(pairs)
+        if offset is None:
             continue
-        offset = sum(v * w for v, w in pairs) / total_w
         for ps in house_effects:
             if p in house_effects[ps]:
                 house_effects[ps][p] -= offset
