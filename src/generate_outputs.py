@@ -29,6 +29,11 @@ import numpy as np
 import pandas as pd
 
 from src.aggregator import PARTIES, current_estimates, load_state
+from src.pollster_reputation import (
+    TIER_WEIGHTS,
+    reputation_tier,
+    reputation_weight,
+)
 from src.scraper import load as load_polls
 
 logger = logging.getLogger(__name__)
@@ -79,6 +84,8 @@ def _load_existing_json() -> dict:
         "national_shares": {},
         "seat_projections": {},
         "house_effects": {},
+        "pollster_reputation": {},
+        "pollster_reputation_tiers": {},
         "marginals": [],
         "vote_share_history": [],
         "seat_history": [],
@@ -182,6 +189,34 @@ def _build_constituency_meta() -> dict[str, dict]:
             "shares_2024": shares,
         }
     return meta
+
+
+# ---------------------------------------------------------------------------
+# Pollster reputation table (for the website methodology block)
+# ---------------------------------------------------------------------------
+
+def _build_pollster_reputation(
+    pollsters_in_dataset: list[str],
+) -> dict[str, dict]:
+    """
+    Build the per-pollster reputation table for the website. Limited to
+    pollsters that actually appear in the current dataset so the methodology
+    table stays tight and reflects what's currently informing the model.
+
+    Unclassified pollsters (reputation_tier returns None) are still emitted
+    with tier 0 so they surface clearly in the UI — the aggregator falls
+    back to DEFAULT_WEIGHT (1.0) for them, but we want readers to be able
+    to spot new / unscored entrants at a glance.
+    """
+    table: dict[str, dict] = {}
+    for p in sorted(set(pollsters_in_dataset)):
+        tier = reputation_tier(p)
+        weight = reputation_weight(p)
+        table[p] = {
+            "tier": tier if tier is not None else 0,
+            "weight": round(float(weight), 2),
+        }
+    return table
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +474,11 @@ def generate(
         seat_history_entry,
     )
 
+    # Pollster reputation table, restricted to pollsters appearing in the
+    # current dataset (keeps the website methodology block tight).
+    pollsters_in_dataset = list(polls["pollster"].dropna().unique().tolist())
+    pollster_reputation = _build_pollster_reputation(pollsters_in_dataset)
+
     # Assemble final payload
     payload = {
         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -447,6 +487,11 @@ def generate(
         "national_shares": national_shares,
         "seat_projections": seat_projections or {},
         "house_effects": house_effects_clean,
+        "pollster_reputation": pollster_reputation,
+        "pollster_reputation_tiers": {
+            str(tier): round(float(weight), 2)
+            for tier, weight in TIER_WEIGHTS.items()
+        },
         "marginals": marginals or [],
         "vote_share_history": merged_history,
         "seat_history": merged_seat_history,

@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from src.pollster_reputation import reputation_weight, tier_summary
 from src.scraper import PARTIES, load as load_polls
 
 logger = logging.getLogger(__name__)
@@ -228,12 +229,16 @@ def _build_daily_grid(
     effective weight on that day (sum of per-poll weights).
 
     Per-poll weight is
-        sample_weight(n) * recency_weight(days_old),
+        sample_weight(n) * recency_weight(days_old) * reputation_weight(pollster),
     where:
       - sample_weight(n) = clip(n / 1000, 0.5, 3.0); polls without a recorded
         sample size fall back to 1.0.
       - recency_weight(d) = 0.5 ** (days_old / OBS_HALFLIFE_DAYS);
         polls from ~6 months ago contribute half as much as today's.
+      - reputation_weight(pollster) is the hand-curated tier weight from
+        src/pollster_reputation.py (1.00 / 0.60 / 0.30 for tiers 1/2/3).
+        This stops high-volume low-reputation pollsters dominating the
+        filter simply by out-publishing BPC-accredited shops.
 
     Recency weighting here (on top of the filter's implicit forgetting via
     process noise) is what actually lets the aggregator respond to fresh
@@ -262,7 +267,8 @@ def _build_daily_grid(
         w_sample = _poll_weight(row.get("sample_size"))
         days_old = max((max_date - d).days, 0)
         w_recency = 0.5 ** (days_old / OBS_HALFLIFE_DAYS)
-        w_poll = w_sample * w_recency
+        w_rep = reputation_weight(pollster)
+        w_poll = w_sample * w_recency * w_rep
         for p in PARTIES:
             val = row.get(p)
             if pd.isna(val) or val is None:
@@ -310,15 +316,19 @@ def _estimate_house_effects(
        YouGov's 2024 near-zero residuals flattening their 2026 +Green
        residuals.
 
-    2. Zero-mean anchoring (uniform per pollster). Without any constraint
+    2. Zero-mean anchoring (reputation-weighted). Without any constraint
        the joint {latent state, house effects} posterior is underdetermined
        — the filter can add +3 pp to every pollster's HE and subtract 3 pp
        from the latent with no penalty. Forcing the mean HE per party to
        zero across pollsters removes that degree of freedom and anchors
-       the latent to the market mean. Each pollster counts equally (not
-       weighted by poll count); this is deliberate, so a high-frequency
-       pollster like Techne doesn't drag the anchor toward their own
-       methodological bias simply because they poll weekly.
+       the latent to the market mean. Pollsters are weighted by their
+       reputation tier (1.00 / 0.60 / 0.30) rather than by poll count or
+       uniformly, so Tier 1 pollsters (YouGov, Ipsos, Opinium, …) have
+       disproportionate say in defining the "market centre" and Tier 3
+       pollsters (non-BPC / opaque / novel) still contribute signal but
+       can't drag the anchor toward their own methodological bias. If
+       every pollster were Tier 1 this reduces to the old uniform anchor,
+       so the change is safe if we ever disable reputation weighting.
     """
     date_idx = {d: i for i, d in enumerate(dates)}
     # residuals[pollster][party] = list of (weight, residual)
@@ -363,23 +373,37 @@ def _estimate_house_effects(
                 sum(w * r for w, r in entries) / total_w
             )
 
-    # Second pass: anchor house effects to a zero mean per party across
-    # pollsters. Each pollster contributes EQUALLY to the anchor (one vote),
-    # regardless of how frequently they poll. This is a change from earlier
-    # logic that weighted by poll count — the problem with volume-weighting
-    # is that a single high-frequency pollster (Techne, 40+ polls in a year
-    # most of them near-identical) dominates the anchor and effectively
-    # drags the latent toward their methodological bias. Each pollster is
-    # an independent methodology; each should have roughly equal say in
-    # defining the "market centre". Pollsters with no poll for this party
-    # are excluded from the average. The offset we subtract gets absorbed
-    # into the next Kalman pass's latent state, which is the correct place
-    # for it.
+    # Second pass: anchor house effects to a zero (reputation-weighted)
+    # mean per party across pollsters. Each pollster contributes according
+    # to its curated reputation tier (1.00 / 0.60 / 0.30), NOT its poll
+    # count and NOT uniformly. Rationale:
+    #   - Volume-weighting let a single high-frequency pollster (Techne,
+    #     40+ polls in a year) dominate the anchor and drag the latent
+    #     toward their methodological bias.
+    #   - Uniform-per-pollster was the previous fix but treats a new
+    #     non-BPC single-client outfit identically to YouGov, which is too
+    #     forgiving when non-mainstream pollsters disagree sharply with
+    #     the BPC core.
+    # Reputation-weighting respects that each pollster is an independent
+    # methodology but lets well-established BPC-accredited firms anchor
+    # more firmly. Pollsters with no poll for this party are excluded.
+    # The offset we subtract gets absorbed into the next Kalman pass's
+    # latent state, which is the correct place for it.
+    pollster_weights = {
+        ps: reputation_weight(ps) for ps in house_effects.keys()
+    }
     for p in PARTIES:
-        vals = [he[p] for he in house_effects.values() if p in he]
-        if not vals:
+        pairs = [
+            (he[p], pollster_weights[ps])
+            for ps, he in house_effects.items()
+            if p in he
+        ]
+        if not pairs:
             continue
-        offset = sum(vals) / len(vals)
+        total_w = sum(w for _, w in pairs)
+        if total_w <= 0:
+            continue
+        offset = sum(v * w for v, w in pairs) / total_w
         for ps in house_effects:
             if p in house_effects[ps]:
                 house_effects[ps][p] -= offset
@@ -690,6 +714,25 @@ if __name__ == "__main__":
         datefmt="%H:%M:%S",
     )
     state = aggregate(force_full=True)
+
+    pollsters = sorted(state.house_effects.keys())
+    summary = tier_summary(pollsters)
+    logger.info(
+        "Reputation weighting: %d pollsters classified", len(pollsters)
+    )
+    logger.info(
+        "  Tier 1 (weight 1.00): %d pollsters", summary["tier_1"]
+    )
+    logger.info(
+        "  Tier 2 (weight 0.60): %d pollsters", summary["tier_2"]
+    )
+    logger.info(
+        "  Tier 3 (weight 0.30): %d pollsters", summary["tier_3"]
+    )
+    logger.info(
+        "  Unclassified (default 1.00): %d pollsters", summary["unclassified"]
+    )
+
     estimates = current_estimates(state)
     print("\nCurrent national estimates:")
     for party, est in sorted(estimates.items(), key=lambda x: -x[1]["mean"]):

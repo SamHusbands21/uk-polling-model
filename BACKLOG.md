@@ -6,7 +6,13 @@ Deferred work items for the UK polling model. Most recent first.
 
 ## Pollster reputation weighting
 
-**Status:** not started — queued for tomorrow.
+**Status:** DONE — shipped with hand-curated three-tier weighting
+(1.00 / 0.60 / 0.30). Implemented as `src/pollster_reputation.py` with
+tiers exported via `data/polling_predictions.json → pollster_reputation`
+and rendered on the site under "How It Works". Applied in both
+`_build_daily_grid` (per-poll weight) and `_estimate_house_effects`
+(reputation-weighted anchoring). Smoke test moved Green national from
+~13.1% to ~13.2% and preserved YouGov's correct +Green house effect.
 
 **Why:** today's anchoring change made every pollster one vote in defining
 the "market centre". That's a principled default but it treats a transparent
